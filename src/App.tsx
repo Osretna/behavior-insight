@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
+import { getRedirectResult, onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import {
   Award,
   BookOpen,
@@ -107,6 +107,9 @@ function MainApp() {
   // Startup connection check & auth listener
   useEffect(() => {
     testConnection();
+    getRedirectResult(auth).catch((err) => {
+      console.error('Redirect sign-in error:', err);
+    });
     const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       setUser(firebaseUser);
       if (firebaseUser) {

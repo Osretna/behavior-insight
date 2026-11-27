@@ -63,9 +63,11 @@ import { RewardsView } from './components/RewardsView';
 import { AIInsightsView } from './components/AIInsightsView';
 import { ReportsView } from './components/ReportsView';
 import { SettingsView } from './components/SettingsView';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 
 function MainApp() {
   const [authReady, setAuthReady] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [userAccount, setUserAccount] = useState<UserAccount | null>(null);
   const [profiles, setProfiles] = useState<MonitoredProfile[]>([]);
@@ -107,14 +109,86 @@ function MainApp() {
   // Startup connection check & auth listener
   useEffect(() => {
     testConnection();
-    getRedirectResult(auth).catch((err) => {
-      console.error('Redirect sign-in error:', err);
-    });
+    let active = true;
+    let resolvedRedirect = false;
+
+    const finalizeAuthReady = () => {
+      if (active && resolvedRedirect) {
+        setAuthReady(true);
+      }
+    };
+
+    const redirectPromise = Promise.race([
+      getRedirectResult(auth),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+    ]);
+
+    redirectPromise
+      .then((result) => {
+        if (!active) return;
+        if (result?.user) {
+          try {
+            sessionStorage.removeItem('bi_auth_redirect_pending');
+            sessionStorage.removeItem('bi_redirect_failed');
+          } catch {
+            // ignore
+          }
+          setAuthError(null);
+          setUser(result.user);
+        } else {
+          try {
+            if (sessionStorage.getItem('bi_auth_redirect_pending') === '1' && !auth.currentUser) {
+              sessionStorage.removeItem('bi_auth_redirect_pending');
+              sessionStorage.setItem('bi_redirect_failed', '1');
+              setAuthError(
+                'تمت العودة من Google دون حفظ الجلسة بسبب قيود المتصفح على ملفات تعريف الارتباط أو النوافذ المنبثقة. يرجى السماح بالنوافذ المنبثقة (Popups) لهذا الموقع أو الفتح في متصفح Chrome / Safari مباشرة ثم المحاولة مجدداً.'
+              );
+            }
+          } catch {
+            // ignore
+          }
+        }
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        try {
+          sessionStorage.removeItem('bi_auth_redirect_pending');
+          sessionStorage.setItem('bi_redirect_failed', '1');
+        } catch {
+          // ignore
+        }
+        const code =
+          typeof err === 'object' && err !== null && 'code' in err
+            ? String((err as { code?: unknown }).code)
+            : '';
+        if (code === 'auth/unauthorized-domain') {
+          const host = typeof window !== 'undefined' ? window.location.hostname : '';
+          setAuthError(
+            `النطاق (${host}) غير مضاف بعد في قائمة النطاقات المصرح بها (Authorized Domains) في إعدادات Firebase Authentication.`
+          );
+        } else {
+          setAuthError('تعذر إكمال تسجيل الدخول بعد العودة من Google. يرجى السماح بالنوافذ المنبثقة والمحاولة مجدداً.');
+        }
+      })
+      .finally(() => {
+        resolvedRedirect = true;
+        finalizeAuthReady();
+      });
+
     const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!active) return;
       setUser(firebaseUser);
       if (firebaseUser) {
         try {
+          sessionStorage.removeItem('bi_auth_redirect_pending');
+          sessionStorage.removeItem('bi_redirect_failed');
+        } catch {
+          // ignore
+        }
+        setAuthError(null);
+        try {
           const account = await ensureUserAccount(firebaseUser);
+          if (!active) return;
           setUserAccount(account);
           setTheme(account.theme || 'dark');
         } catch (err) {
@@ -126,9 +200,13 @@ function MainApp() {
         setProfilesLoaded(false);
         setActiveProfileId('');
       }
-      setAuthReady(true);
+      finalizeAuthReady();
     });
-    return () => unsub();
+
+    return () => {
+      active = false;
+      unsub();
+    };
   }, []);
 
   // Subscribe to profiles when authenticated
@@ -234,7 +312,15 @@ function MainApp() {
   }
 
   if (!user) {
-    return <AuthGate />;
+    return (
+      <AuthGate
+        initialError={authError}
+        onSignedIn={(signedInUser) => {
+          setAuthError(null);
+          setUser(signedInUser);
+        }}
+      />
+    );
   }
 
   if (!profilesLoaded) {
@@ -386,24 +472,27 @@ function MainApp() {
         </div>
 
         {/* Footer Actions */}
-        <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
-          <button
-            type="button"
-            onClick={handleThemeToggle}
-            className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-          >
-            {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
-            <span>{theme === 'dark' ? 'فاتح' : 'داكن'}</span>
-          </button>
+        <div className="pt-4 border-t border-slate-100 dark:border-slate-800 space-y-2.5">
+          <PWAInstallButton />
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={handleThemeToggle}
+              className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+            >
+              {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
+              <span>{theme === 'dark' ? 'فاتح' : 'داكن'}</span>
+            </button>
 
-          <button
-            type="button"
-            onClick={() => signOut(auth)}
-            className="min-h-[40px] px-3 rounded-xl text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-          >
-            <LogOut className="w-4 h-4" />
-            <span>خروج</span>
-          </button>
+            <button
+              type="button"
+              onClick={() => signOut(auth)}
+              className="min-h-[40px] px-3 rounded-xl text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>خروج</span>
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -495,14 +584,17 @@ function MainApp() {
               </nav>
             </div>
 
-            <button
-              type="button"
-              onClick={() => signOut(auth)}
-              className="mt-6 min-h-[44px] px-4 rounded-xl bg-rose-500/10 text-rose-600 dark:text-rose-400 text-sm font-semibold flex items-center justify-center gap-2"
-            >
-              <LogOut className="w-4 h-4" />
-              <span>تسجيل الخروج</span>
-            </button>
+            <div className="mt-6 space-y-2">
+              <PWAInstallButton />
+              <button
+                type="button"
+                onClick={() => signOut(auth)}
+                className="w-full min-h-[44px] px-4 rounded-xl bg-rose-500/10 text-rose-600 dark:text-rose-400 text-sm font-semibold flex items-center justify-center gap-2"
+              >
+                <LogOut className="w-4 h-4" />
+                <span>تسجيل الخروج</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -652,6 +744,8 @@ function MainApp() {
           setPendingAction(null);
         }}
       />
+
+      <OfflineIndicator />
     </div>
   );
 }

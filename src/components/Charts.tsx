@@ -163,8 +163,10 @@ export function AxisRadarChart({
 
 export function ScoreLineChart({
   data,
+  onSelectDate,
 }: {
   data: { dateKey: string; label: string; score: number | null }[];
+  onSelectDate?: (dateKey: string) => void;
 }) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const w = 520;
@@ -259,6 +261,7 @@ export function ScoreLineChart({
               key={d.dateKey}
               onMouseEnter={() => setHoveredIdx(idx)}
               onMouseLeave={() => setHoveredIdx(null)}
+              onClick={() => onSelectDate?.(d.dateKey)}
               className="cursor-pointer"
             >
               <rect x={x - 12} y={padY} width={24} height={innerH} fill="transparent" />
@@ -292,8 +295,10 @@ export function ScoreLineChart({
 
 export function WeeklyBarChart({
   bars,
+  onSelectDate,
 }: {
-  bars: { label: string; value: number | null; color?: string }[];
+  bars: { label: string; dateKey?: string; value: number | null; color?: string }[];
+  onSelectDate?: (dateKey: string) => void;
 }) {
   return (
     <div className="w-full h-44 flex items-end justify-between gap-2 pt-4 pb-1">
@@ -301,11 +306,16 @@ export function WeeklyBarChart({
         const val = bar.value ?? 0;
         const pct = Math.min(100, Math.max(0, (val / 10) * 100));
         return (
-          <div key={idx} className="flex-1 flex flex-col items-center gap-2 h-full justify-end">
-            <span className="text-[11px] font-mono tabular-nums text-slate-600 dark:text-slate-300">
+          <button
+            key={idx}
+            type="button"
+            onClick={() => bar.dateKey && onSelectDate?.(bar.dateKey)}
+            className="flex-1 flex flex-col items-center gap-2 h-full justify-end group cursor-pointer"
+          >
+            <span className="text-[11px] font-mono tabular-nums text-slate-600 dark:text-slate-300 group-hover:text-emerald-500">
               {bar.value !== null ? bar.value.toFixed(1) : '—'}
             </span>
-            <div className="w-full max-w-[34px] h-28 rounded-lg bg-slate-100 dark:bg-slate-800/70 flex items-end overflow-hidden">
+            <div className="w-full max-w-[34px] h-28 rounded-lg bg-slate-100 dark:bg-slate-800/70 flex items-end overflow-hidden group-hover:ring-2 group-hover:ring-emerald-500/40 transition-all">
               <div
                 style={{
                   height: `${bar.value !== null ? Math.max(8, pct) : 0}%`,
@@ -317,7 +327,7 @@ export function WeeklyBarChart({
             <span className="text-[11px] text-slate-500 dark:text-slate-400 truncate max-w-full">
               {bar.label}
             </span>
-          </div>
+          </button>
         );
       })}
     </div>
@@ -328,10 +338,12 @@ export function CalendarHeatmap({
   assessments,
   endDateKey,
   days = 35,
+  onSelectDate,
 }: {
   assessments: DailyAssessment[];
   endDateKey: string;
   days?: number;
+  onSelectDate?: (dateKey: string) => void;
 }) {
   const [selectedDay, setSelectedDay] = useState<{ dateKey: string; score: number | null } | null>(null);
   const map = new Map(assessments.map((a) => [a.dateKey, a.scores.total]));
@@ -353,17 +365,25 @@ export function CalendarHeatmap({
   return (
     <div>
       <div className="grid grid-cols-7 gap-1.5">
-        {cells.map((cell) => (
-          <button
-            key={cell.dateKey}
-            type="button"
-            onClick={() => setSelectedDay(cell)}
-            title={`${cell.dateKey}: ${cell.score !== null ? `${cell.score}/10` : 'غير مسجل'}`}
-            className={`h-8 rounded-md text-[11px] font-mono tabular-nums flex items-center justify-center transition-transform hover:scale-105 ${getCellStyle(cell.score)}`}
-          >
-            {cell.dateKey.slice(8)}
-          </button>
-        ))}
+        {cells.map((cell) => {
+          const isSelected = selectedDay?.dateKey === cell.dateKey;
+          return (
+            <button
+              key={cell.dateKey}
+              type="button"
+              onClick={() => {
+                setSelectedDay(cell);
+                onSelectDate?.(cell.dateKey);
+              }}
+              title={`${cell.dateKey}: ${cell.score !== null ? `${cell.score}/10` : 'غير مسجل'}`}
+              className={`h-8 rounded-md text-[11px] font-mono tabular-nums flex items-center justify-center transition-transform hover:scale-105 cursor-pointer ${getCellStyle(
+                cell.score
+              )} ${isSelected ? 'ring-2 ring-amber-400 ring-offset-1 dark:ring-offset-[#0D192D]' : ''}`}
+            >
+              {cell.dateKey.slice(8)}
+            </button>
+          );
+        })}
       </div>
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
         <span>

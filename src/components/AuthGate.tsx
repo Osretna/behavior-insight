@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { signInWithPopup, signInWithRedirect, type User } from 'firebase/auth';
-import { AlertTriangle, Lock } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { signInWithPopup, type User } from 'firebase/auth';
+import { AlertTriangle, ExternalLink, Lock } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
 import { IslamicGeometricHeaderBackdrop } from './IslamicDecor';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -14,12 +14,30 @@ export function AuthGate({
 }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(initialError);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [popupBlocked, setPopupBlocked] = useState(false);
+  const signingInRef = useRef(false);
 
   useEffect(() => {
+    try {
+      sessionStorage.removeItem('bi_auth_redirect_pending');
+      sessionStorage.removeItem('bi_redirect_failed');
+    } catch {
+      // ignore
+    }
     if (initialError) {
       setError(initialError);
     }
   }, [initialError]);
+
+  const isInIframe = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return window.self !== window.top;
+    } catch {
+      return true;
+    }
+  }, []);
 
   const isInAppBrowser = useMemo(() => {
     if (typeof navigator === 'undefined') return false;
@@ -29,16 +47,18 @@ export function AuthGate({
   }, []);
 
   const handleGmailSignIn = async () => {
-    setLoading(true);
+    if (signingInRef.current) return;
+    signingInRef.current = true;
     setError(null);
+    setErrorCode(null);
+    setPopupBlocked(false);
+
+    // Trigger popup immediately inside the click gesture before any async awaits
+    const popupPromise = signInWithPopup(auth, googleProvider);
+    setLoading(true);
+
     try {
-      const credential = await signInWithPopup(auth, googleProvider);
-      try {
-        sessionStorage.removeItem('bi_auth_redirect_pending');
-        sessionStorage.removeItem('bi_redirect_failed');
-      } catch {
-        // ignore storage errors
-      }
+      const credential = await popupPromise;
       if (credential?.user) {
         onSignedIn?.(credential.user);
       }
@@ -47,44 +67,29 @@ export function AuthGate({
         typeof err === 'object' && err !== null && 'code' in err
           ? String((err as { code?: unknown }).code)
           : '';
+      setErrorCode(code || null);
 
-      if (code === 'auth/popup-blocked' || code === 'auth/cancelled-popup-request') {
-        let alreadyFailedRedirect = false;
-        try {
-          alreadyFailedRedirect = sessionStorage.getItem('bi_redirect_failed') === '1';
-        } catch {
-          alreadyFailedRedirect = false;
-        }
-
-        if (!alreadyFailedRedirect) {
-          try {
-            sessionStorage.setItem('bi_auth_redirect_pending', '1');
-            await signInWithRedirect(auth, googleProvider);
-            return;
-          } catch {
-            try {
-              sessionStorage.removeItem('bi_auth_redirect_pending');
-            } catch {
-              // ignore
-            }
-          }
-        }
+      if (code === 'auth/popup-blocked') {
+        setPopupBlocked(true);
         setError(
-          'المتصفح منع نافذة تسجيل الدخول المنبثقة. يرجى السماح بالنوافذ المنبثقة (Popups) لهذا الموقع أو فتح الرابط في متصفح Chrome / Safari ثم المحاولة مجدداً.'
+          'المتصفح منع النافذة المنبثقة لتسجيل الدخول. اسمح بالنوافذ المنبثقة (Pop-ups) لهذا الموقع من شريط العنوان أعلى المتصفح ثم اضغط الزر مرة أخرى.'
         );
+      } else if (code === 'auth/cancelled-popup-request') {
+        setError('تم فتح طلب تسجيل دخول سابق. يرجى إغلاق أي نافذة تسجيل دخول معلّقة والمحاولة مرة أخرى.');
       } else if (code === 'auth/unauthorized-domain') {
         const host = typeof window !== 'undefined' ? window.location.hostname : '';
         setError(
           `النطاق (${host}) غير مضاف بعد في قائمة النطاقات المصرح بها (Authorized Domains) في إعدادات Firebase Authentication.`
         );
       } else if (code === 'auth/popup-closed-by-user') {
-        setError('تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.');
+        setError('تم إغلاق نافذة تسجيل الدخول قبل إتمام اختيار الحساب.');
       } else if (code === 'auth/network-request-failed') {
         setError('تعذر الاتصال بخدمة المصادقة. يرجى التحقق من اتصال الإنترنت والمحاولة مجدداً.');
       } else {
-        setError('تعذر تسجيل الدخول بحساب Gmail. يرجى المحاولة مجدداً أو السماح بالنوافذ المنبثقة.');
+        setError('تعذر تسجيل الدخول بحساب Gmail. يرجى المحاولة مجدداً.');
       }
     } finally {
+      signingInRef.current = false;
       setLoading(false);
     }
   };
@@ -125,7 +130,7 @@ export function AuthGate({
           <div className="p-3.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-200 text-xs leading-relaxed text-right flex items-start gap-2.5">
             <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
             <span>
-              أنت تفتح التطبيق من داخل متصفح تطبيق آخر. إذا عاد بك المتصفح لصفحة الدخول، افتح الرابط في
+              أنت تفتح التطبيق من داخل متصفح تطبيق آخر. إذا تعذر تسجيل الدخول، افتح الرابط في
               <strong> Chrome </strong>
               أو
               <strong> Safari </strong>
@@ -135,8 +140,24 @@ export function AuthGate({
         )}
 
         {error && (
-          <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-200 text-xs leading-relaxed text-right">
-            {error}
+          <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-200 text-xs leading-relaxed text-right space-y-2">
+            <p>{error}</p>
+            {errorCode && (
+              <p className="text-[11px] font-mono text-rose-300/80" dir="ltr">
+                {errorCode}
+              </p>
+            )}
+            {(popupBlocked || isInIframe) && typeof window !== 'undefined' && (
+              <a
+                href={window.location.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-white font-semibold transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>فتح الصفحة في نافذة مستقلة لتسجيل الدخول</span>
+              </a>
+            )}
           </div>
         )}
 

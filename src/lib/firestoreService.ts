@@ -5,15 +5,15 @@ import {
   getDoc,
   getDocs,
   onSnapshot,
-  orderBy,
   query,
   serverTimestamp,
   setDoc,
   updateDoc,
+  where,
   type Unsubscribe,
 } from 'firebase/firestore';
 import type { User } from 'firebase/auth';
-import { db, handleFirestoreError, OperationType } from './firebase';
+import { auth, db, handleFirestoreError, OperationType } from './firebase';
 import {
   AXIS_META,
   BADGE_CATALOG,
@@ -41,6 +41,7 @@ import {
 import {
   calculateStreak,
   clampScore,
+  computeLiveAssessmentForDate,
   computeObedienceScore,
   computePrayerScore,
   computeResponsibilitiesScore,
@@ -58,6 +59,36 @@ export function makeSafeId(prefix: string): string {
 function trunc(val: string | undefined | null, maxLen: number): string {
   if (!val) return '';
   return String(val).slice(0, maxLen);
+}
+
+function toSortComparable(val: unknown): number | string {
+  if (val == null) return 0;
+  if (typeof val === 'number') return val;
+  if (typeof val === 'string') return val;
+  if (typeof val === 'object') {
+    const maybeTs = val as { toMillis?: () => number; seconds?: number };
+    if (typeof maybeTs.toMillis === 'function') return maybeTs.toMillis();
+    if (typeof maybeTs.seconds === 'number') return maybeTs.seconds * 1000;
+  }
+  return 0;
+}
+
+function sortByField<T extends Record<string, unknown>>(
+  items: T[],
+  field: string,
+  dir: 'asc' | 'desc'
+): T[] {
+  return [...items].sort((a, b) => {
+    const va = toSortComparable(a[field]);
+    const vb = toSortComparable(b[field]);
+    let cmp = 0;
+    if (typeof va === 'number' && typeof vb === 'number') {
+      cmp = va - vb;
+    } else {
+      cmp = String(va).localeCompare(String(vb));
+    }
+    return dir === 'asc' ? cmp : -cmp;
+  });
 }
 
 // --- User Account ---
@@ -132,17 +163,26 @@ export async function updateUserPin(
 // --- Profiles ---
 export function subscribeProfiles(
   uid: string,
-  onData: (profiles: MonitoredProfile[]) => void
+  onData: (profiles: MonitoredProfile[]) => void,
+  onError?: (err: Error) => void
 ): Unsubscribe {
   const path = `users/${uid}/profiles`;
-  const q = query(collection(db, 'users', uid, 'profiles'), orderBy('createdAt', 'asc'));
+  const q = query(collection(db, 'users', uid, 'profiles'), where('ownerId', '==', uid));
   return onSnapshot(
     q,
     (snapshot) => {
       const list = snapshot.docs.map((d) => ({ ...(d.data() as Omit<MonitoredProfile, 'id'>), id: d.id }));
-      onData(list);
+      onData(sortByField(list as Array<MonitoredProfile & Record<string, unknown>>, 'createdAt', 'asc') as MonitoredProfile[]);
     },
-    (error) => handleFirestoreError(error, OperationType.LIST, path)
+    (error) => {
+      if (onError) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error('subscribeProfiles error:', msg);
+        onError(new Error(msg));
+        return;
+      }
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
   );
 }
 
@@ -166,6 +206,11 @@ export async function createMonitoredProfile(
     responsibilities: 25,
   };
   try {
+    const userRef = doc(db, 'users', uid);
+    const userSnap = await getDoc(userRef);
+    if (!userSnap.exists() && auth.currentUser) {
+      await ensureUserAccount(auth.currentUser);
+    }
     await setDoc(doc(db, 'users', uid, 'profiles', profileId), {
       ownerId: uid,
       name: trunc(input.name.trim(), 100),
@@ -286,6 +331,15 @@ export async function updateProfileDetails(
   }
 }
 
+export async function deleteMonitoredProfile(uid: string, profileId: string): Promise<void> {
+  const path = `users/${uid}/profiles/${profileId}`;
+  try {
+    await deleteDoc(doc(db, 'users', uid, 'profiles', profileId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 export async function updateProfileWeights(
   uid: string,
   profileId: string,
@@ -340,18 +394,28 @@ export function subscribeProfileCollection<T>(
   colName: string,
   onData: (items: T[]) => void,
   orderField?: string,
-  dir: 'asc' | 'desc' = 'desc'
+  dir: 'asc' | 'desc' = 'desc',
+  onError?: (err: Error) => void
 ): Unsubscribe {
   const path = `users/${uid}/profiles/${profileId}/${colName}`;
   const colRef = collection(db, 'users', uid, 'profiles', profileId, colName);
-  const q = orderField ? query(colRef, orderBy(orderField, dir)) : colRef;
+  const q = query(colRef, where('ownerId', '==', uid));
   return onSnapshot(
     q,
     (snapshot) => {
-      const items = snapshot.docs.map((d) => ({ ...(d.data() as Record<string, unknown>), id: d.id } as T));
-      onData(items);
+      const items = snapshot.docs.map((d) => ({ ...(d.data() as Record<string, unknown>), id: d.id }));
+      const sorted = orderField ? sortByField(items, orderField, dir) : items;
+      onData(sorted as T[]);
     },
-    (error) => handleFirestoreError(error, OperationType.LIST, path)
+    (error) => {
+      if (onError) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error(`subscribeProfileCollection(${colName}) error:`, msg);
+        onError(new Error(msg));
+        return;
+      }
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
   );
 }
 
@@ -514,46 +578,40 @@ export async function syncComputedAssessmentForDate(
   tasks: TaskItem[],
   currentAssessment?: DailyAssessment
 ): Promise<void> {
-  if (currentAssessment?.manualOverride?.isOverridden || currentAssessment?.status === 'finalized') {
+  if (currentAssessment?.manualOverride?.isOverridden) {
     return;
   }
-  const dayObs = observations.filter((o) => o.dateKey === dateKey);
-  const dayStudy = sessions.filter((s) => s.dateKey === dateKey);
-  const dayTasks = tasks.filter((t) => t.dateKey === dateKey);
 
-  const states = currentAssessment?.axisStates ?? {
-    obedience: 'unrated',
-    study: 'unrated',
-    prayer: 'unrated',
-    responsibilities: 'unrated',
-  };
+  const computed = computeLiveAssessmentForDate(
+    profile,
+    dateKey,
+    observations,
+    sessions,
+    prayerRecord,
+    tasks,
+    currentAssessment
+  );
 
-  const obScore = computeObedienceScore(dayObs, states.obedience);
-  const stScore = computeStudyScore(dayStudy, states.study);
-  const prScore = computePrayerScore(prayerRecord, states.prayer);
-  const reScore = computeResponsibilitiesScore(dayTasks, states.responsibilities);
-
-  const nextScores = {
-    obedience: obScore,
-    study: stScore,
-    prayer: prScore,
-    responsibilities: reScore,
-    total: computeWeightedTotal(
-      { obedience: obScore, study: stScore, prayer: prScore, responsibilities: reScore },
-      profile.weights
-    ),
-  };
-
-  const nextStates: Record<AxisKey, AxisState> = {
-    obedience: dayObs.length > 0 ? deriveAxisState(obScore) : states.obedience,
-    study: dayStudy.length > 0 ? deriveAxisState(stScore) : states.study,
-    prayer:
-      prayerRecord && Object.values(prayerRecord.prayers).some((p) => p.status !== 'unlogged')
-        ? deriveAxisState(prScore)
-        : states.prayer,
-    responsibilities:
-      dayTasks.some((t) => t.status !== 'pending') ? deriveAxisState(reScore) : states.responsibilities,
-  };
+  // Skip Firestore write if computed scores and states already match persisted assessment
+  if (currentAssessment) {
+    const sameScores =
+      currentAssessment.scores.obedience === computed.scores.obedience &&
+      currentAssessment.scores.study === computed.scores.study &&
+      currentAssessment.scores.prayer === computed.scores.prayer &&
+      currentAssessment.scores.responsibilities === computed.scores.responsibilities &&
+      currentAssessment.scores.total === computed.scores.total;
+    const sameStates =
+      currentAssessment.axisStates.obedience === computed.axisStates.obedience &&
+      currentAssessment.axisStates.study === computed.axisStates.study &&
+      currentAssessment.axisStates.prayer === computed.axisStates.prayer &&
+      currentAssessment.axisStates.responsibilities === computed.axisStates.responsibilities;
+    if (sameScores && sameStates) {
+      return;
+    }
+  } else if (computed.scores.total === null) {
+    // Nothing entered yet for a brand-new date; avoid creating empty docs unnecessarily
+    return;
+  }
 
   await saveDailyAssessment(
     uid,
@@ -561,8 +619,8 @@ export async function syncComputedAssessmentForDate(
     dateKey,
     {
       status: currentAssessment?.status ?? 'draft',
-      axisStates: nextStates,
-      scores: nextScores,
+      axisStates: computed.axisStates,
+      scores: computed.scores,
       dailyEvents: currentAssessment?.dailyEvents ?? '',
       endOfDaySummary: currentAssessment?.endOfDaySummary ?? '',
     },
@@ -928,7 +986,8 @@ export async function evaluateAndSyncProfileRewards(
   sessions: StudySession[],
   prayerRecords: PrayerRecord[],
   tasks: TaskItem[],
-  achievements: Achievement[]
+  achievements: Achievement[],
+  rewards: Reward[] = []
 ): Promise<void> {
   const today = getTodayDateKey();
   const existingKeys = new Set(achievements.map((a) => a.badgeKey));
@@ -985,8 +1044,6 @@ export async function evaluateAndSyncProfileRewards(
     await awardBadge('distinguished_week');
   }
 
-  // Compute deterministic points & stars from positive records + badge bonuses - redeemed rewards?
-  // Note: To keep manual redemptions safe, only add earnedPointsBonus & delta from records if totalPoints < base
   const obsPoints = observations.reduce((s, o) => s + o.pointsAwarded, 0);
   const studyPoints = sessions.filter((s) => s.status === 'completed').length * 15;
   const prayerPoints = prayerRecords.reduce((acc, rec) => {
@@ -996,19 +1053,21 @@ export async function evaluateAndSyncProfileRewards(
       Object.values(rec.prayers).filter((p) => p.status === 'late').length * 4
     );
   }, 0);
-  const taskPoints = tasks.filter((t) => t.status === 'completed' && t.guardianApproved).length * 12;
+  const taskPoints = tasks.filter((t) => t.status === 'completed').length * 12;
   const badgePoints = achievements.reduce((s, a) => s + a.pointsBonus, 0) + earnedPointsBonus;
   const computedEarned = obsPoints + studyPoints + prayerPoints + taskPoints + badgePoints;
+  const redeemedCost = rewards.filter((r) => r.redeemed).reduce((s, r) => s + r.costPoints, 0);
+  const netPoints = Math.max(0, computedEarned - redeemedCost);
   const stars = Math.floor(computedEarned / 25);
 
   if (computedEarned >= 1000) {
     await awardBadge('month_achievement');
   }
 
-  if (streak !== profile.activeStreak || stars !== profile.totalStars || (earnedPointsBonus > 0 && profile.totalPoints < computedEarned)) {
+  if (streak !== profile.activeStreak || stars !== profile.totalStars || netPoints !== profile.totalPoints) {
     await syncProfileStats(uid, profile.id, {
       activeStreak: streak,
-      totalPoints: Math.max(profile.totalPoints + earnedPointsBonus, computedEarned),
+      totalPoints: netPoints,
       totalStars: stars,
     });
   }
@@ -1141,7 +1200,9 @@ export async function exportProfileBackup(uid: string, profileId: string): Promi
 
   const cols: Record<string, unknown[]> = {};
   for (const name of subcollections) {
-    const snap = await getDocs(collection(db, 'users', uid, 'profiles', profileId, name));
+    const snap = await getDocs(
+      query(collection(db, 'users', uid, 'profiles', profileId, name), where('ownerId', '==', uid))
+    );
     cols[name] = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
   }
   backup.collections = cols;

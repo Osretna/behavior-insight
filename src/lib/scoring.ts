@@ -79,7 +79,8 @@ export function computeObedienceScore(
 
 export function computeStudyScore(
   sessions: StudySession[],
-  manualState: AxisState
+  manualState: AxisState,
+  dailyGoalMinutes = 60
 ): number | null {
   if (sessions.length === 0) {
     if (manualState === 'unrated') return null;
@@ -102,7 +103,9 @@ export function computeStudyScore(
     const score = statusBase + qualityFactor + (timeRatio >= 0.9 ? 0.5 : -0.5);
     return acc + clampScore(score);
   }, 0);
-  return clampScore(sum / sessions.length);
+  const totalMinutes = sessions.reduce((acc, s) => acc + (s.actualMinutes || 0), 0);
+  const goalBonus = dailyGoalMinutes > 0 && totalMinutes >= dailyGoalMinutes ? 0.3 : 0;
+  return clampScore(sum / sessions.length + goalBonus);
 }
 
 export function computePrayerScore(
@@ -149,12 +152,21 @@ export function computeResponsibilitiesScore(
     if (manualState === 'partial') return 6;
     return 3;
   }
-  const total = evaluated.reduce((acc, t) => {
-    let base = t.status === 'completed' ? 9.2 : t.status === 'partial' ? 6.2 : 2.5;
-    if (t.guardianApproved && t.status === 'completed') base += 0.8;
-    return acc + clampScore(base);
+  const evaluatedAvg =
+    evaluated.reduce((acc, t) => {
+      let base = t.status === 'completed' ? 9.2 : t.status === 'partial' ? 6.2 : 2.5;
+      if (t.guardianApproved && t.status === 'completed') base += 0.8;
+      return acc + clampScore(base);
+    }, 0) / evaluated.length;
+
+  // Blend quality of evaluated tasks with overall completion progress for the day
+  const progressUnits = tasks.reduce((acc, t) => {
+    if (t.status === 'completed') return acc + 1;
+    if (t.status === 'partial') return acc + 0.55;
+    return acc;
   }, 0);
-  return clampScore(total / evaluated.length);
+  const completionScore = (progressUnits / tasks.length) * 10;
+  return clampScore(evaluatedAvg * 0.65 + completionScore * 0.35);
 }
 
 export function computeWeightedTotal(
@@ -212,6 +224,121 @@ export function deriveAxisState(score: number | null): AxisState {
   if (score >= 7.5) return 'committed';
   if (score >= 4.5) return 'partial';
   return 'not_committed';
+}
+
+export function computeLiveAssessmentForDate(
+  profile: { id: string; ownerId: string; weights: AxisWeights; dailyGoalMinutes: number },
+  dateKey: string,
+  observations: BehaviorObservation[],
+  sessions: StudySession[],
+  prayerRecord: PrayerRecord | null,
+  tasks: TaskItem[],
+  currentAssessment?: DailyAssessment
+): DailyAssessment {
+  if (currentAssessment?.manualOverride?.isOverridden) {
+    return currentAssessment;
+  }
+
+  const dayObs = observations.filter((o) => o.dateKey === dateKey);
+  const dayStudy = sessions.filter((s) => s.dateKey === dateKey);
+  const dayTasks = tasks.filter((t) => t.dateKey === dateKey);
+  const hasObs = dayObs.length > 0;
+  const hasStudy = dayStudy.length > 0;
+  const hasPrayer =
+    !!prayerRecord && Object.values(prayerRecord.prayers).some((p) => p.status !== 'unlogged');
+  const hasTasks = dayTasks.some((t) => t.status !== 'pending');
+
+  const baseStates: Record<AxisKey, AxisState> = currentAssessment?.axisStates ?? {
+    obedience: 'unrated',
+    study: 'unrated',
+    prayer: 'unrated',
+    responsibilities: 'unrated',
+  };
+
+  // Use records automatically whenever present; preserve explicit manual slider scores only when no records exist
+  const obScore = hasObs
+    ? computeObedienceScore(dayObs, baseStates.obedience)
+    : currentAssessment?.scores.obedience ?? computeObedienceScore([], baseStates.obedience);
+
+  const stScore = hasStudy
+    ? computeStudyScore(dayStudy, baseStates.study, profile.dailyGoalMinutes)
+    : currentAssessment?.scores.study ?? computeStudyScore([], baseStates.study, profile.dailyGoalMinutes);
+
+  const prScore = hasPrayer
+    ? computePrayerScore(prayerRecord, baseStates.prayer)
+    : currentAssessment?.scores.prayer ?? computePrayerScore(null, baseStates.prayer);
+
+  const reScore = hasTasks
+    ? computeResponsibilitiesScore(dayTasks, baseStates.responsibilities)
+    : currentAssessment?.scores.responsibilities ??
+      computeResponsibilitiesScore([], baseStates.responsibilities);
+
+  const scores = {
+    obedience: obScore,
+    study: stScore,
+    prayer: prScore,
+    responsibilities: reScore,
+    total: computeWeightedTotal(
+      { obedience: obScore, study: stScore, prayer: prScore, responsibilities: reScore },
+      profile.weights
+    ),
+  };
+
+  const axisStates: Record<AxisKey, AxisState> = {
+    obedience: hasObs ? deriveAxisState(obScore) : baseStates.obedience,
+    study: hasStudy ? deriveAxisState(stScore) : baseStates.study,
+    prayer: hasPrayer ? deriveAxisState(prScore) : baseStates.prayer,
+    responsibilities: hasTasks ? deriveAxisState(reScore) : baseStates.responsibilities,
+  };
+
+  return {
+    id: currentAssessment?.id ?? dateKey,
+    ownerId: currentAssessment?.ownerId ?? profile.ownerId,
+    profileId: currentAssessment?.profileId ?? profile.id,
+    dateKey,
+    status: currentAssessment?.status ?? 'draft',
+    axisStates,
+    scores,
+    dailyEvents: currentAssessment?.dailyEvents ?? '',
+    endOfDaySummary: currentAssessment?.endOfDaySummary ?? '',
+    createdAt: currentAssessment?.createdAt,
+    updatedAt: currentAssessment?.updatedAt,
+  };
+}
+
+export function buildEffectiveAssessments(
+  profile: { id: string; ownerId: string; weights: AxisWeights; dailyGoalMinutes: number } | null,
+  assessments: DailyAssessment[],
+  observations: BehaviorObservation[],
+  sessions: StudySession[],
+  prayerRecords: PrayerRecord[],
+  tasks: TaskItem[]
+): DailyAssessment[] {
+  if (!profile) return assessments;
+  const dateKeys = new Set<string>();
+  dateKeys.add(getTodayDateKey());
+  assessments.forEach((a) => dateKeys.add(a.dateKey));
+  observations.forEach((o) => dateKeys.add(o.dateKey));
+  sessions.forEach((s) => dateKeys.add(s.dateKey));
+  prayerRecords.forEach((p) => dateKeys.add(p.dateKey));
+  tasks.forEach((t) => dateKeys.add(t.dateKey));
+
+  const existingByDate = new Map(assessments.map((a) => [a.dateKey, a]));
+  const prayerByDate = new Map(prayerRecords.map((p) => [p.dateKey, p]));
+
+  return Array.from(dateKeys)
+    .sort((a, b) => b.localeCompare(a))
+    .map((dk) =>
+      computeLiveAssessmentForDate(
+        profile,
+        dk,
+        observations,
+        sessions,
+        prayerByDate.get(dk) ?? null,
+        tasks,
+        existingByDate.get(dk)
+      )
+    );
 }
 
 export function calculateStreak(assessments: DailyAssessment[]): number {

@@ -12,11 +12,14 @@ import {
   LogOut,
   Menu,
   Moon,
+  RefreshCw,
   Settings,
   Shield,
   Sparkles,
   Sun,
   UserCheck,
+  UserPlus,
+  Users,
   X,
 } from 'lucide-react';
 import { auth, testConnection } from './lib/firebase';
@@ -29,7 +32,7 @@ import {
   syncComputedAssessmentForDate,
   updateUserPreferences,
 } from './lib/firestoreService';
-import { getTodayDateKey } from './lib/scoring';
+import { buildEffectiveAssessments, getTodayDateKey } from './lib/scoring';
 import type {
   Achievement,
   AIInsight,
@@ -51,6 +54,7 @@ import type {
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { AuthGate } from './components/AuthGate';
 import { ProfileSetupModal } from './components/ProfileSetupModal';
+import { ProfileManagerModal } from './components/ProfileManagerModal';
 import { GuardianPinModal } from './components/GuardianPinModal';
 import { IslamicEmblem } from './components/IslamicDecor';
 import { DashboardView } from './components/DashboardView';
@@ -72,13 +76,17 @@ function MainApp() {
   const [userAccount, setUserAccount] = useState<UserAccount | null>(null);
   const [profiles, setProfiles] = useState<MonitoredProfile[]>([]);
   const [profilesLoaded, setProfilesLoaded] = useState(false);
+  const [profilesError, setProfilesError] = useState<string | null>(null);
+  const [profilesRetryTick, setProfilesRetryTick] = useState(0);
   const [activeProfileId, setActiveProfileId] = useState<string>('');
 
   // Mode & UI State
   const [appMode, setAppMode] = useState<AppMode>('guardian');
   const [activeTab, setActiveTab] = useState<AppTab>('dashboard');
+  const [selectedAssessmentDate, setSelectedAssessmentDate] = useState<string>(() => getTodayDateKey());
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [profileManagerOpen, setProfileManagerOpen] = useState(false);
   const [pinModalOpen, setPinModalOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
 
@@ -110,81 +118,30 @@ function MainApp() {
   useEffect(() => {
     testConnection();
     let active = true;
-    let resolvedRedirect = false;
 
-    const finalizeAuthReady = () => {
-      if (active && resolvedRedirect) {
-        setAuthReady(true);
-      }
-    };
+    try {
+      sessionStorage.removeItem('bi_auth_redirect_pending');
+      sessionStorage.removeItem('bi_redirect_failed');
+    } catch {
+      // ignore
+    }
 
-    const redirectPromise = Promise.race([
-      getRedirectResult(auth),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
-    ]);
-
-    redirectPromise
+    getRedirectResult(auth)
       .then((result) => {
         if (!active) return;
         if (result?.user) {
-          try {
-            sessionStorage.removeItem('bi_auth_redirect_pending');
-            sessionStorage.removeItem('bi_redirect_failed');
-          } catch {
-            // ignore
-          }
           setAuthError(null);
           setUser(result.user);
-        } else {
-          try {
-            if (sessionStorage.getItem('bi_auth_redirect_pending') === '1' && !auth.currentUser) {
-              sessionStorage.removeItem('bi_auth_redirect_pending');
-              sessionStorage.setItem('bi_redirect_failed', '1');
-              setAuthError(
-                'تمت العودة من Google دون حفظ الجلسة بسبب قيود المتصفح على ملفات تعريف الارتباط أو النوافذ المنبثقة. يرجى السماح بالنوافذ المنبثقة (Popups) لهذا الموقع أو الفتح في متصفح Chrome / Safari مباشرة ثم المحاولة مجدداً.'
-              );
-            }
-          } catch {
-            // ignore
-          }
         }
       })
-      .catch((err: unknown) => {
-        if (!active) return;
-        try {
-          sessionStorage.removeItem('bi_auth_redirect_pending');
-          sessionStorage.setItem('bi_redirect_failed', '1');
-        } catch {
-          // ignore
-        }
-        const code =
-          typeof err === 'object' && err !== null && 'code' in err
-            ? String((err as { code?: unknown }).code)
-            : '';
-        if (code === 'auth/unauthorized-domain') {
-          const host = typeof window !== 'undefined' ? window.location.hostname : '';
-          setAuthError(
-            `النطاق (${host}) غير مضاف بعد في قائمة النطاقات المصرح بها (Authorized Domains) في إعدادات Firebase Authentication.`
-          );
-        } else {
-          setAuthError('تعذر إكمال تسجيل الدخول بعد العودة من Google. يرجى السماح بالنوافذ المنبثقة والمحاولة مجدداً.');
-        }
-      })
-      .finally(() => {
-        resolvedRedirect = true;
-        finalizeAuthReady();
+      .catch(() => {
+        // ignore stale redirect state; AuthGate uses signInWithPopup
       });
 
     const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       if (!active) return;
       setUser(firebaseUser);
       if (firebaseUser) {
-        try {
-          sessionStorage.removeItem('bi_auth_redirect_pending');
-          sessionStorage.removeItem('bi_redirect_failed');
-        } catch {
-          // ignore
-        }
         setAuthError(null);
         try {
           const account = await ensureUserAccount(firebaseUser);
@@ -200,7 +157,7 @@ function MainApp() {
         setProfilesLoaded(false);
         setActiveProfileId('');
       }
-      finalizeAuthReady();
+      setAuthReady(true);
     });
 
     return () => {
@@ -209,23 +166,63 @@ function MainApp() {
     };
   }, []);
 
-  // Subscribe to profiles when authenticated
+  // Subscribe to profiles when authenticated (with graceful error & timeout recovery)
   useEffect(() => {
     if (!user) return;
-    const unsub = subscribeProfiles(user.uid, (list) => {
-      setProfiles(list);
-      setProfilesLoaded(true);
-      setActiveProfileId((prev) => {
-        if (prev && list.some((p) => p.id === prev)) return prev;
-        return list[0]?.id || '';
-      });
-    });
-    return () => unsub();
-  }, [user]);
+    let settled = false;
+    setProfilesError(null);
+
+    const timeoutId = window.setTimeout(() => {
+      if (!settled) {
+        setProfilesError('استغرق تحميل الملفات وقتاً أطول من المعتاد. تأكد من اتصالك بالإنترنت أو أعد المحاولة.');
+        setProfilesLoaded(true);
+      }
+    }, 8000);
+
+    const unsub = subscribeProfiles(
+      user.uid,
+      (list) => {
+        settled = true;
+        window.clearTimeout(timeoutId);
+        setProfilesError(null);
+        setProfiles(list);
+        setProfilesLoaded(true);
+        setActiveProfileId((prev) => {
+          if (prev && list.some((p) => p.id === prev)) return prev;
+          return list[0]?.id || '';
+        });
+      },
+      (err) => {
+        settled = true;
+        window.clearTimeout(timeoutId);
+        setProfilesError(err.message || 'تعذر تحميل قائمة الأسماء.');
+        setProfilesLoaded(true);
+      }
+    );
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      unsub();
+    };
+  }, [user, profilesRetryTick]);
 
   const activeProfile = useMemo(
     () => profiles.find((p) => p.id === activeProfileId) || null,
     [profiles, activeProfileId]
+  );
+
+  // Instant 0ms automatic evaluation computed from all entered records across all dates
+  const effectiveAssessments = useMemo(
+    () =>
+      buildEffectiveAssessments(
+        activeProfile,
+        assessments,
+        observations,
+        studySessions,
+        prayerRecords,
+        tasks
+      ),
+    [activeProfile, assessments, observations, studySessions, prayerRecords, tasks]
   );
 
   // Subscribe to all active profile collections
@@ -237,67 +234,89 @@ function MainApp() {
 
     ensureDailyAssessment(uid, pid, todayKey).catch(() => {});
 
+    const logColError = (name: string) => (err: Error) => {
+      console.warn(`Collection ${name} listener warning:`, err.message);
+    };
+
     const unsubs = [
-      subscribeProfileCollection<BehaviorCategory>(uid, pid, 'behaviorCategories', setCategories),
-      subscribeProfileCollection<DailyAssessment>(uid, pid, 'dailyAssessments', setAssessments, 'dateKey', 'desc'),
-      subscribeProfileCollection<BehaviorObservation>(uid, pid, 'observations', setObservations, 'createdAt', 'desc'),
-      subscribeProfileCollection<StudySession>(uid, pid, 'studySessions', setStudySessions, 'createdAt', 'desc'),
-      subscribeProfileCollection<PrayerRecord>(uid, pid, 'prayerRecords', setPrayerRecords, 'dateKey', 'desc'),
-      subscribeProfileCollection<Responsibility>(uid, pid, 'responsibilities', setResponsibilities, 'createdAt', 'asc'),
-      subscribeProfileCollection<TaskItem>(uid, pid, 'tasks', setTasks, 'createdAt', 'desc'),
-      subscribeProfileCollection<Reward>(uid, pid, 'rewards', setRewards, 'createdAt', 'desc'),
-      subscribeProfileCollection<Achievement>(uid, pid, 'achievements', setAchievements, 'earnedAt', 'desc'),
-      subscribeProfileCollection<AIInsight>(uid, pid, 'aiInsights', setAiInsights, 'createdAt', 'desc'),
-      subscribeProfileCollection<BehaviorReport>(uid, pid, 'reports', setReports, 'createdAt', 'desc'),
-      subscribeProfileCollection<AuditLog>(uid, pid, 'auditLogs', setAuditLogs, 'createdAt', 'desc'),
+      subscribeProfileCollection<BehaviorCategory>(uid, pid, 'behaviorCategories', setCategories, undefined, 'desc', logColError('behaviorCategories')),
+      subscribeProfileCollection<DailyAssessment>(uid, pid, 'dailyAssessments', setAssessments, 'dateKey', 'desc', logColError('dailyAssessments')),
+      subscribeProfileCollection<BehaviorObservation>(uid, pid, 'observations', setObservations, 'createdAt', 'desc', logColError('observations')),
+      subscribeProfileCollection<StudySession>(uid, pid, 'studySessions', setStudySessions, 'createdAt', 'desc', logColError('studySessions')),
+      subscribeProfileCollection<PrayerRecord>(uid, pid, 'prayerRecords', setPrayerRecords, 'dateKey', 'desc', logColError('prayerRecords')),
+      subscribeProfileCollection<Responsibility>(uid, pid, 'responsibilities', setResponsibilities, 'createdAt', 'asc', logColError('responsibilities')),
+      subscribeProfileCollection<TaskItem>(uid, pid, 'tasks', setTasks, 'createdAt', 'desc', logColError('tasks')),
+      subscribeProfileCollection<Reward>(uid, pid, 'rewards', setRewards, 'createdAt', 'desc', logColError('rewards')),
+      subscribeProfileCollection<Achievement>(uid, pid, 'achievements', setAchievements, 'earnedAt', 'desc', logColError('achievements')),
+      subscribeProfileCollection<AIInsight>(uid, pid, 'aiInsights', setAiInsights, 'createdAt', 'desc', logColError('aiInsights')),
+      subscribeProfileCollection<BehaviorReport>(uid, pid, 'reports', setReports, 'createdAt', 'desc', logColError('reports')),
+      subscribeProfileCollection<AuditLog>(uid, pid, 'auditLogs', setAuditLogs, 'createdAt', 'desc', logColError('auditLogs')),
     ];
     return () => unsubs.forEach((u) => u());
   }, [user, activeProfileId]);
 
-  // Debounced auto-computation of today's scores and badges
+  // Debounced auto-persistence of computed scores (across all modified dates) and badges/points
   const syncTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (!user || !activeProfile) return;
-    const todayKey = getTodayDateKey();
-    const todayAssessment = assessments.find((a) => a.dateKey === todayKey);
-    const todayPrayer = prayerRecords.find((p) => p.dateKey === todayKey) ?? null;
 
     if (syncTimerRef.current) window.clearTimeout(syncTimerRef.current);
     syncTimerRef.current = window.setTimeout(() => {
-      syncComputedAssessmentForDate(
-        user.uid,
-        activeProfile,
-        todayKey,
-        observations,
-        studySessions,
-        todayPrayer,
-        tasks,
-        todayAssessment
-      ).catch(() => {});
+      const existingByDate = new Map(assessments.map((a) => [a.dateKey, a]));
+      const prayerByDate = new Map(prayerRecords.map((p) => [p.dateKey, p]));
+
+      for (const eff of effectiveAssessments) {
+        const stored = existingByDate.get(eff.dateKey);
+        if (stored?.manualOverride?.isOverridden) continue;
+        const needsWrite = stored
+          ? stored.scores.obedience !== eff.scores.obedience ||
+            stored.scores.study !== eff.scores.study ||
+            stored.scores.prayer !== eff.scores.prayer ||
+            stored.scores.responsibilities !== eff.scores.responsibilities ||
+            stored.scores.total !== eff.scores.total
+          : eff.scores.total !== null;
+
+        if (needsWrite) {
+          syncComputedAssessmentForDate(
+            user.uid,
+            activeProfile,
+            eff.dateKey,
+            observations,
+            studySessions,
+            prayerByDate.get(eff.dateKey) ?? null,
+            tasks,
+            stored
+          ).catch(() => {});
+        }
+      }
 
       evaluateAndSyncProfileRewards(
         user.uid,
         activeProfile,
-        assessments,
+        effectiveAssessments,
         observations,
         studySessions,
         prayerRecords,
         tasks,
-        achievements
+        achievements,
+        rewards
       ).catch(() => {});
-    }, 650);
+    }, 450);
 
     return () => {
       if (syncTimerRef.current) window.clearTimeout(syncTimerRef.current);
     };
   }, [
     user,
-    activeProfile?.id,
-    activeProfile?.weights,
-    observations.length,
-    studySessions.length,
+    activeProfile,
+    assessments,
+    effectiveAssessments,
+    observations,
+    studySessions,
     prayerRecords,
     tasks,
+    achievements,
+    rewards,
   ]);
 
   if (!authReady) {
@@ -325,14 +344,68 @@ function MainApp() {
 
   if (!profilesLoaded) {
     return (
-      <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120]">
-        <p className="text-sm text-slate-500 dark:text-slate-400">جاري تحميل الملفات الشخصية...</p>
+      <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120] p-6">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <IslamicEmblem size={44} />
+          <p className="text-sm text-slate-600 dark:text-slate-300 font-medium">جاري تحميل قائمة الأسماء والملفات الشخصية...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (profilesError && profiles.length === 0) {
+    return (
+      <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120] p-6">
+        <div className="max-w-md w-full rounded-3xl bg-white dark:bg-[#0D192D] border border-slate-200 dark:border-slate-800 p-7 text-center space-y-4 shadow-xl">
+          <IslamicEmblem size={48} />
+          <h2 className="text-lg font-bold text-slate-900 dark:text-white">تعذر تحميل الملفات الشخصية</h2>
+          <p className="text-xs text-rose-600 dark:text-rose-400 leading-relaxed bg-rose-500/10 border border-rose-500/20 rounded-xl p-3">
+            {profilesError}
+          </p>
+          <div className="flex flex-wrap items-center justify-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => {
+                setProfilesLoaded(false);
+                setProfilesError(null);
+                setProfilesRetryTick((t) => t + 1);
+              }}
+              className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold inline-flex items-center gap-2 cursor-pointer"
+            >
+              <RefreshCw className="w-4 h-4" />
+              <span>إعادة المحاولة</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setProfilesError(null)}
+              className="min-h-[44px] px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-2 cursor-pointer"
+            >
+              <UserPlus className="w-4 h-4" />
+              <span>إضافة ملف جديد</span>
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => signOut(auth)}
+            className="text-xs text-slate-500 hover:text-rose-500 underline cursor-pointer"
+          >
+            تبديل حساب Gmail
+          </button>
+        </div>
       </div>
     );
   }
 
   if (profiles.length === 0 || !activeProfile) {
-    return <ProfileSetupModal uid={user.uid} onCreated={(id) => setActiveProfileId(id)} />;
+    return (
+      <ProfileSetupModal
+        uid={user.uid}
+        onCreated={(id) => {
+          setProfilesError(null);
+          setActiveProfileId(id);
+        }}
+      />
+    );
   }
 
   const handleToggleMode = () => {
@@ -414,14 +487,24 @@ function MainApp() {
           </div>
 
           {/* Profile Switcher */}
-          <div>
-            <label className="block text-[11px] text-slate-500 dark:text-slate-400 mb-1">
-              الملف النشط
-            </label>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <label className="text-[11px] text-slate-500 dark:text-slate-400">
+                الاسم المختار للتقييم ({profiles.length})
+              </label>
+              <button
+                type="button"
+                onClick={() => setProfileManagerOpen(true)}
+                className="text-[11px] font-bold text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1 cursor-pointer"
+              >
+                <UserPlus className="w-3.5 h-3.5" />
+                <span>قائمة الأسماء</span>
+              </button>
+            </div>
             <select
               value={activeProfile.id}
               onChange={(e) => setActiveProfileId(e.target.value)}
-              className="w-full min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs font-bold text-slate-900 dark:text-white"
+              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs font-bold text-slate-900 dark:text-white cursor-pointer"
             >
               {profiles.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -553,17 +636,30 @@ function MainApp() {
                 </button>
               </div>
 
-              <select
-                value={activeProfile.id}
-                onChange={(e) => setActiveProfileId(e.target.value)}
-                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs font-bold"
-              >
-                {profiles.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.age} سنة)
-                  </option>
-                ))}
-              </select>
+              <div className="space-y-2">
+                <select
+                  value={activeProfile.id}
+                  onChange={(e) => setActiveProfileId(e.target.value)}
+                  className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs font-bold"
+                >
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.age} سنة)
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileMenuOpen(false);
+                    setProfileManagerOpen(true);
+                  }}
+                  className="w-full min-h-[40px] px-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Users className="w-4 h-4" />
+                  <span>قائمة الأسماء وإضافة طفل جديد</span>
+                </button>
+              </div>
 
               <nav className="space-y-1">
                 {visibleNav.map((item) => (
@@ -600,17 +696,78 @@ function MainApp() {
       )}
 
       {/* Main Content Area */}
-      <main className="flex-1 min-w-0 p-4 sm:p-6 lg:p-8 pb-20 lg:pb-10 max-w-7xl w-full mx-auto">
+      <main className="flex-1 min-w-0 p-4 sm:p-6 lg:p-8 pb-20 lg:pb-10 max-w-7xl w-full mx-auto space-y-6">
+        {/* Always-Visible Names Dropdown & Evaluation Quick Bar */}
+        <div className="no-print rounded-2xl bg-white/95 dark:bg-[#0D192D]/95 backdrop-blur-md border border-slate-200 dark:border-slate-800 p-3.5 sm:px-5 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm">
+          <div className="flex items-center gap-3 min-w-0 flex-1">
+            <div
+              className="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold text-base shrink-0 shadow-sm"
+              style={{ backgroundColor: activeProfile.avatarColor || '#0D9488' }}
+            >
+              {activeProfile.name.trim().charAt(0)}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                اختر الاسم من القائمة للتقييم والمتابعة ({profiles.length} {profiles.length === 1 ? 'اسم' : 'أسماء'})
+              </div>
+              <div className="flex items-center gap-2 mt-0.5">
+                <select
+                  aria-label="اختيار الاسم للتقييم"
+                  value={activeProfile.id}
+                  onChange={(e) => setActiveProfileId(e.target.value)}
+                  className="w-full sm:w-auto min-w-[200px] max-w-full min-h-[38px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-sm font-bold text-slate-900 dark:text-white cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} — {p.age} سنة
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setProfileManagerOpen(true)}
+              className="min-h-[40px] px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 hover:border-emerald-500/40 text-xs font-bold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+            >
+              <UserPlus className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+              <span>إضافة / قائمة الأسماء</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedAssessmentDate(getTodayDateKey());
+                setActiveTab('assessment');
+              }}
+              className="min-h-[40px] px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              <span>تقييم {activeProfile.name} اليوم</span>
+            </button>
+          </div>
+        </div>
+
         {activeTab === 'dashboard' && (
           <DashboardView
+            uid={user.uid}
             profile={activeProfile}
             appMode={appMode}
-            assessments={assessments}
+            guardianName={guardianName}
+            assessments={effectiveAssessments}
             observations={observations}
             studySessions={studySessions}
             prayerRecords={prayerRecords}
+            responsibilities={responsibilities}
             tasks={tasks}
             onNavigate={handleNavigate}
+            onOpenAssessmentForDate={(dk) => {
+              setSelectedAssessmentDate(dk);
+              setActiveTab('assessment');
+            }}
           />
         )}
         {activeTab === 'assessment' && (
@@ -619,7 +776,8 @@ function MainApp() {
             profile={activeProfile}
             appMode={appMode}
             guardianName={guardianName}
-            assessments={assessments}
+            initialDateKey={selectedAssessmentDate}
+            assessments={effectiveAssessments}
             observations={observations}
             studySessions={studySessions}
             prayerRecords={prayerRecords}
@@ -670,7 +828,7 @@ function MainApp() {
             profile={activeProfile}
             appMode={appMode}
             guardianName={guardianName}
-            assessments={assessments}
+            assessments={effectiveAssessments}
             observations={observations}
             studySessions={studySessions}
             prayerRecords={prayerRecords}
@@ -682,7 +840,7 @@ function MainApp() {
           <ReportsView
             uid={user.uid}
             profile={activeProfile}
-            assessments={assessments}
+            assessments={effectiveAssessments}
             observations={observations}
             studySessions={studySessions}
             prayerRecords={prayerRecords}
@@ -743,6 +901,18 @@ function MainApp() {
           if (pendingAction) pendingAction();
           setPendingAction(null);
         }}
+      />
+
+      {/* Profile Names Manager Modal */}
+      <ProfileManagerModal
+        isOpen={profileManagerOpen}
+        uid={user.uid}
+        profiles={profiles}
+        activeProfileId={activeProfileId}
+        onSelectProfile={(id) => {
+          setActiveProfileId(id);
+        }}
+        onClose={() => setProfileManagerOpen(false)}
       />
 
       <OfflineIndicator />

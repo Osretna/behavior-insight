@@ -33,6 +33,7 @@ export function DailyAssessmentView({
   profile,
   appMode,
   guardianName,
+  initialDateKey,
   assessments,
   observations,
   studySessions,
@@ -43,13 +44,19 @@ export function DailyAssessmentView({
   profile: MonitoredProfile;
   appMode: AppMode;
   guardianName: string;
+  initialDateKey?: string;
   assessments: DailyAssessment[];
   observations: BehaviorObservation[];
   studySessions: StudySession[];
   prayerRecords: PrayerRecord[];
   tasks: TaskItem[];
 }) {
-  const [dateKey, setDateKey] = useState(getTodayDateKey());
+  const [dateKey, setDateKey] = useState(initialDateKey || getTodayDateKey());
+
+  useEffect(() => {
+    if (initialDateKey) setDateKey(initialDateKey);
+  }, [initialDateKey]);
+
   const existing = assessments.find((a) => a.dateKey === dateKey);
 
   const [axisStates, setAxisStates] = useState<Record<AxisKey, AxisState>>({
@@ -57,6 +64,12 @@ export function DailyAssessmentView({
     study: 'unrated',
     prayer: 'unrated',
     responsibilities: 'unrated',
+  });
+  const [directAxisScores, setDirectAxisScores] = useState<Record<AxisKey, number | null>>({
+    obedience: null,
+    study: null,
+    prayer: null,
+    responsibilities: null,
   });
   const [dailyEvents, setDailyEvents] = useState('');
   const [endOfDaySummary, setEndOfDaySummary] = useState('');
@@ -76,6 +89,15 @@ export function DailyAssessmentView({
   useEffect(() => {
     ensureDailyAssessment(uid, profile.id, dateKey).catch(() => {});
   }, [uid, profile.id, dateKey]);
+
+  useEffect(() => {
+    setDirectAxisScores({
+      obedience: null,
+      study: null,
+      prayer: null,
+      responsibilities: null,
+    });
+  }, [profile.id, dateKey]);
 
   useEffect(() => {
     if (existing) {
@@ -105,10 +127,28 @@ export function DailyAssessmentView({
   const dayPrayer = prayerRecords.find((p) => p.dateKey === dateKey) ?? null;
   const dayTasks = tasks.filter((t) => t.dateKey === dateKey);
 
-  const computedObedience = computeObedienceScore(dayObs, axisStates.obedience);
-  const computedStudy = computeStudyScore(dayStudy, axisStates.study);
-  const computedPrayer = computePrayerScore(dayPrayer, axisStates.prayer);
-  const computedResp = computeResponsibilitiesScore(dayTasks, axisStates.responsibilities);
+  const hasObsLogs = dayObs.length > 0;
+  const hasStudyLogs = dayStudy.length > 0;
+  const hasPrayerLogs =
+    !!dayPrayer && Object.values(dayPrayer.prayers).some((p) => p.status !== 'unlogged');
+  const hasTaskLogs = dayTasks.some((t) => t.status !== 'pending');
+
+  const computedObedience =
+    directAxisScores.obedience ??
+    (hasObsLogs ? computeObedienceScore(dayObs, axisStates.obedience) : existing?.scores.obedience ?? computeObedienceScore([], axisStates.obedience));
+  const computedStudy =
+    directAxisScores.study ??
+    (hasStudyLogs
+      ? computeStudyScore(dayStudy, axisStates.study, profile.dailyGoalMinutes)
+      : existing?.scores.study ?? computeStudyScore([], axisStates.study, profile.dailyGoalMinutes));
+  const computedPrayer =
+    directAxisScores.prayer ??
+    (hasPrayerLogs ? computePrayerScore(dayPrayer, axisStates.prayer) : existing?.scores.prayer ?? computePrayerScore(null, axisStates.prayer));
+  const computedResp =
+    directAxisScores.responsibilities ??
+    (hasTaskLogs
+      ? computeResponsibilitiesScore(dayTasks, axisStates.responsibilities)
+      : existing?.scores.responsibilities ?? computeResponsibilitiesScore([], axisStates.responsibilities));
 
   const activeScores = existing?.manualOverride?.isOverridden
     ? existing.scores
@@ -238,11 +278,27 @@ export function DailyAssessmentView({
       </div>
 
       {/* Important Principle Banner */}
-      <div className="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/50 flex items-start gap-3 text-xs sm:text-sm text-emerald-900 dark:text-emerald-200">
-        <Info className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
-        <p className="leading-relaxed">
-          تُحتسب الدرجة تلقائياً من 1 إلى 10 استناداً إلى السجلات الفعلية للمحاور والأوزان المعتمدة. المحاور التي حالتها «لم يتم التقييم بعد» لا تتحول إلى أصفار ولا تؤثر سلباً على المتوسط.
-        </p>
+      <div className="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs sm:text-sm text-emerald-900 dark:text-emerald-200">
+        <div className="flex items-start gap-3">
+          <Info className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+          <p className="leading-relaxed">
+            التقييم محسوب أوتوماتيكياً من 1 إلى 10 بناءً على ما تم إدخاله في المحاور الأربعة والأوزان المعتمدة. المحاور غير المسجلة بعد لا تتحول إلى أصفار.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-1.5 text-[11px] font-bold shrink-0">
+          <span className="px-2.5 py-1 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-emerald-500/20">
+            مواقف: {dayObs.length}
+          </span>
+          <span className="px-2.5 py-1 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-emerald-500/20">
+            مذاكرة: {dayStudy.length}
+          </span>
+          <span className="px-2.5 py-1 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-emerald-500/20">
+            صلوات: {dayPrayer ? Object.values(dayPrayer.prayers).filter((p) => p.status !== 'unlogged').length : 0}/5
+          </span>
+          <span className="px-2.5 py-1 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-emerald-500/20">
+            مهام منجزة: {dayTasks.filter((t) => t.status === 'completed').length}/{dayTasks.length}
+          </span>
+        </div>
       </div>
 
       {/* Overall Score Summary */}
@@ -343,6 +399,9 @@ export function DailyAssessmentView({
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {(['obedience', 'study', 'prayer', 'responsibilities'] as AxisKey[]).map((axis) => {
           const scoreVal = activeScores[axis];
+          const deriveAxisState = (val: number): AxisState =>
+            val >= 7.5 ? 'committed' : val >= 4.5 ? 'partial' : 'not_committed';
+
           return (
             <div
               key={axis}
@@ -355,6 +414,7 @@ export function DailyAssessmentView({
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
                     الوزن المعتمد: {profile.weights[axis]}%
+                    {directAxisScores[axis] !== null ? ' · تقييم مباشر' : ' · محسوب تلقائياً'}
                   </p>
                 </div>
                 <div className="text-left tabular-nums">
@@ -365,6 +425,72 @@ export function DailyAssessmentView({
                 </div>
               </div>
 
+              {appMode === 'guardian' && (
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-800 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-slate-700 dark:text-slate-300">
+                      تحديد الدرجة مباشرة (1 إلى 10)
+                    </span>
+                    {directAxisScores[axis] !== null && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setDirectAxisScores((prev) => ({ ...prev, [axis]: null }))
+                        }
+                        className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 hover:underline cursor-pointer"
+                      >
+                        إعادة للحساب التلقائي
+                      </button>
+                    )}
+                  </div>
+
+                  <input
+                    type="range"
+                    min={1}
+                    max={10}
+                    step={0.5}
+                    value={scoreVal ?? 8}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setDirectAxisScores((prev) => ({ ...prev, [axis]: val }));
+                      setAxisStates((prev) => ({ ...prev, [axis]: deriveAxisState(val) }));
+                    }}
+                    className="w-full accent-emerald-600 cursor-pointer"
+                  />
+
+                  <div className="flex flex-wrap gap-1.5">
+                    {[
+                      { val: 10, label: 'ممتاز 10' },
+                      { val: 8, label: 'جيد جداً 8' },
+                      { val: 6, label: 'متوسط 6' },
+                      { val: 4, label: 'دعم 4' },
+                    ].map((preset) => {
+                      const isSelected = directAxisScores[axis] === preset.val;
+                      return (
+                        <button
+                          key={preset.val}
+                          type="button"
+                          onClick={() => {
+                            setDirectAxisScores((prev) => ({ ...prev, [axis]: preset.val }));
+                            setAxisStates((prev) => ({
+                              ...prev,
+                              [axis]: deriveAxisState(preset.val),
+                            }));
+                          }}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer ${
+                            isSelected
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-emerald-500/40'
+                          }`}
+                        >
+                          {preset.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-2">
                 {stateOptions.map((opt) => {
                   const active = axisStates[axis] === opt.value;
@@ -373,7 +499,10 @@ export function DailyAssessmentView({
                       key={opt.value}
                       type="button"
                       disabled={appMode === 'tracked'}
-                      onClick={() => setAxisStates({ ...axisStates, [axis]: opt.value })}
+                      onClick={() => {
+                        setAxisStates((prev) => ({ ...prev, [axis]: opt.value }));
+                        setDirectAxisScores((prev) => ({ ...prev, [axis]: null }));
+                      }}
                       className={`min-h-[42px] px-3 py-2 rounded-xl text-xs font-semibold transition-colors cursor-pointer disabled:opacity-60 ${
                         active
                           ? 'bg-emerald-600 text-white'

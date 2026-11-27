@@ -1,0 +1,6 @@
+{
+  "name": "BEHAVIOR INSIGHT — نظام التقييم والمتابعة السلوكية",
+  "description": "نظام ذكي متكامل لمتابعة وتقييم السلوك اليومي والتربوي عبر أربعة محاور رئيسية: سماع الكلام، المذاكرة، الصلاة، والواجبات والمسؤوليات، مع تحليلات ذكية وتقارير احترافية.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

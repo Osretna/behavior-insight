@@ -1,0 +1,648 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 4.1: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Pillar 3: Reusable Hardened Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string
+        && id.size() >= 1
+        && id.size() <= 128
+        && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidDateKey(dateKey) {
+      return dateKey is string
+        && dateKey.size() == 10
+        && dateKey.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOptionalString(data, key, maxLen) {
+      return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isOptionalNumber(data, key) {
+      return !(key in data) || (data[key] is int || data[key] is float);
+    }
+
+    function isValidScoreValue(val) {
+      return val == null || ((val is int || val is float) && val >= 1 && val <= 10);
+    }
+
+    function isValidAxisState(val) {
+      return val is string && val in ['committed', 'partial', 'not_committed', 'unrated'];
+    }
+
+    function isValidPrayerEntry(entry) {
+      return entry is map
+        && entry.keys().hasAll(['status', 'loggedAt', 'note'])
+        && entry.keys().hasOnly(['status', 'loggedAt', 'note'])
+        && entry.status is string && entry.status in ['on_time', 'late', 'missed', 'unlogged']
+        && entry.loggedAt is string && entry.loggedAt.size() <= 40
+        && entry.note is string && entry.note.size() <= 400;
+    }
+
+    function isValidWeights(weights) {
+      return weights is map
+        && weights.keys().hasAll(['obedience', 'study', 'prayer', 'responsibilities'])
+        && weights.keys().hasOnly(['obedience', 'study', 'prayer', 'responsibilities'])
+        && weights.obedience is int && weights.obedience >= 0 && weights.obedience <= 100
+        && weights.study is int && weights.study >= 0 && weights.study <= 100
+        && weights.prayer is int && weights.prayer >= 0 && weights.prayer <= 100
+        && weights.responsibilities is int && weights.responsibilities >= 0 && weights.responsibilities <= 100
+        && (weights.obedience + weights.study + weights.prayer + weights.responsibilities) == 100;
+    }
+
+    // Master Gate helpers
+    function userExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    function profileOwnedBy(userId, profileId) {
+      return userExists(userId)
+        && exists(/databases/$(database)/documents/users/$(userId)/profiles/$(profileId))
+        && get(/databases/$(database)/documents/users/$(userId)/profiles/$(profileId)).data.ownerId == request.auth.uid;
+    }
+
+    // --- Validation Blueprints (Pillar 2) ---
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'preferredLanguage', 'theme', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'preferredLanguage', 'theme', 'pinEnabled', 'pinHash', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid) && data.uid == userId && data.uid == request.auth.uid
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.role == 'guardian'
+        && data.preferredLanguage is string && data.preferredLanguage in ['ar', 'en']
+        && data.theme is string && data.theme in ['dark', 'light']
+        && (!('pinEnabled' in data) || data.pinEnabled is bool)
+        && isOptionalString(data, 'pinHash', 256)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProfile(data, userId) {
+      return data.keys().hasAll(['ownerId', 'name', 'age', 'weights', 'prayerAlertsEnabled', 'dailyGoalMinutes', 'activeStreak', 'totalPoints', 'totalStars', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'name', 'age', 'city', 'country', 'latitude', 'longitude', 'avatarColor', 'weights', 'prayerAlertsEnabled', 'dailyGoalMinutes', 'activeStreak', 'totalPoints', 'totalStars', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && data.age is int && data.age >= 3 && data.age <= 99
+        && isOptionalString(data, 'city', 100)
+        && isOptionalString(data, 'country', 100)
+        && isOptionalNumber(data, 'latitude')
+        && isOptionalNumber(data, 'longitude')
+        && isOptionalString(data, 'avatarColor', 32)
+        && isValidWeights(data.weights)
+        && data.prayerAlertsEnabled is bool
+        && data.dailyGoalMinutes is int && data.dailyGoalMinutes >= 10 && data.dailyGoalMinutes <= 600
+        && data.activeStreak is int && data.activeStreak >= 0 && data.activeStreak <= 10000
+        && data.totalPoints is int && data.totalPoints >= 0 && data.totalPoints <= 10000000
+        && data.totalStars is int && data.totalStars >= 0 && data.totalStars <= 1000000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBehaviorCategory(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'key', 'title', 'description', 'weight', 'subCriteria', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'key', 'title', 'description', 'weight', 'subCriteria', 'updatedAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.key is string && data.key in ['obedience', 'study', 'prayer', 'responsibilities']
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+        && data.description is string && data.description.size() <= 500
+        && data.weight is int && data.weight >= 0 && data.weight <= 100
+        && data.subCriteria is list && data.subCriteria.size() <= 20
+        && (data.subCriteria.size() == 0 || (data.subCriteria[0] is string && data.subCriteria[0].size() <= 120))
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDailyAssessment(data, userId, profileId, dateKey) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'dateKey', 'status', 'axisStates', 'scores', 'dailyEvents', 'endOfDaySummary', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'dateKey', 'status', 'axisStates', 'scores', 'manualOverride', 'dailyEvents', 'endOfDaySummary', 'createdAt', 'updatedAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.dateKey == dateKey && isValidDateKey(data.dateKey)
+        && data.status is string && data.status in ['draft', 'finalized']
+        && data.axisStates is map
+        && data.axisStates.keys().hasAll(['obedience', 'study', 'prayer', 'responsibilities'])
+        && data.axisStates.keys().hasOnly(['obedience', 'study', 'prayer', 'responsibilities'])
+        && isValidAxisState(data.axisStates.obedience)
+        && isValidAxisState(data.axisStates.study)
+        && isValidAxisState(data.axisStates.prayer)
+        && isValidAxisState(data.axisStates.responsibilities)
+        && data.scores is map
+        && data.scores.keys().hasAll(['obedience', 'study', 'prayer', 'responsibilities', 'total'])
+        && data.scores.keys().hasOnly(['obedience', 'study', 'prayer', 'responsibilities', 'total'])
+        && isValidScoreValue(data.scores.obedience)
+        && isValidScoreValue(data.scores.study)
+        && isValidScoreValue(data.scores.prayer)
+        && isValidScoreValue(data.scores.responsibilities)
+        && isValidScoreValue(data.scores.total)
+        && (!('manualOverride' in data) || (
+          data.manualOverride is map
+          && data.manualOverride.keys().hasAll(['isOverridden', 'reason', 'modifiedBy', 'originalTotal'])
+          && data.manualOverride.keys().hasOnly(['isOverridden', 'reason', 'modifiedBy', 'originalTotal'])
+          && data.manualOverride.isOverridden is bool
+          && data.manualOverride.reason is string && data.manualOverride.reason.size() <= 500
+          && data.manualOverride.modifiedBy is string && data.manualOverride.modifiedBy.size() <= 120
+          && isValidScoreValue(data.manualOverride.originalTotal)
+        ))
+        && data.dailyEvents is string && data.dailyEvents.size() <= 3000
+        && data.endOfDaySummary is string && data.endOfDaySummary.size() <= 2000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidObservation(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'dateKey', 'situation', 'guidanceGiven', 'reaction', 'outcome', 'firstTimeResponse', 'neededReminder', 'criterionKey', 'isPoliteQuestion', 'pointsAwarded', 'notes', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'dateKey', 'situation', 'guidanceGiven', 'reaction', 'outcome', 'firstTimeResponse', 'neededReminder', 'criterionKey', 'isPoliteQuestion', 'pointsAwarded', 'notes', 'createdAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && isValidDateKey(data.dateKey)
+        && data.situation is string && data.situation.size() >= 1 && data.situation.size() <= 500
+        && data.guidanceGiven is string && data.guidanceGiven.size() >= 1 && data.guidanceGiven.size() <= 500
+        && data.reaction is string && data.reaction.size() >= 1 && data.reaction.size() <= 500
+        && data.outcome is string && data.outcome in ['positive', 'partial', 'needs_support']
+        && data.firstTimeResponse is bool
+        && data.neededReminder is bool
+        && data.criterionKey is string && data.criterionKey.size() <= 80
+        && data.isPoliteQuestion is bool
+        && data.pointsAwarded is int && data.pointsAwarded >= 0 && data.pointsAwarded <= 50
+        && data.notes is string && data.notes.size() <= 1000
+        && data.createdAt is timestamp;
+    }
+
+    function isValidStudySession(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'dateKey', 'subject', 'goalDescription', 'targetMinutes', 'startTime', 'endTime', 'actualMinutes', 'activityType', 'focusLevel', 'qualityRating', 'status', 'postponeReason', 'notes', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'dateKey', 'subject', 'goalDescription', 'targetMinutes', 'startTime', 'endTime', 'actualMinutes', 'activityType', 'focusLevel', 'qualityRating', 'status', 'postponeReason', 'notes', 'createdAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && isValidDateKey(data.dateKey)
+        && data.subject is string && data.subject.size() >= 1 && data.subject.size() <= 120
+        && data.goalDescription is string && data.goalDescription.size() >= 1 && data.goalDescription.size() <= 300
+        && data.targetMinutes is int && data.targetMinutes >= 1 && data.targetMinutes <= 480
+        && data.startTime is string && data.startTime.size() <= 20
+        && data.endTime is string && data.endTime.size() <= 20
+        && data.actualMinutes is int && data.actualMinutes >= 0 && data.actualMinutes <= 480
+        && data.activityType is string && data.activityType in ['homework', 'review', 'exercises', 'reading']
+        && data.focusLevel is int && data.focusLevel >= 1 && data.focusLevel <= 5
+        && data.qualityRating is int && data.qualityRating >= 1 && data.qualityRating <= 5
+        && data.status is string && data.status in ['completed', 'partial', 'incomplete', 'postponed']
+        && data.postponeReason is string && data.postponeReason.size() <= 300
+        && data.notes is string && data.notes.size() <= 1000
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPrayerRecord(data, userId, profileId, dateKey) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'dateKey', 'prayers', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'dateKey', 'prayers', 'updatedAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.dateKey == dateKey && isValidDateKey(data.dateKey)
+        && data.prayers is map
+        && data.prayers.keys().hasAll(['fajr', 'dhuhr', 'asr', 'maghrib', 'isha'])
+        && data.prayers.keys().hasOnly(['fajr', 'dhuhr', 'asr', 'maghrib', 'isha'])
+        && isValidPrayerEntry(data.prayers.fajr)
+        && isValidPrayerEntry(data.prayers.dhuhr)
+        && isValidPrayerEntry(data.prayers.asr)
+        && isValidPrayerEntry(data.prayers.maghrib)
+        && isValidPrayerEntry(data.prayers.isha)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidResponsibility(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'title', 'description', 'dueTime', 'priority', 'recurrence', 'requiresProof', 'active', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'title', 'description', 'dueTime', 'priority', 'recurrence', 'requiresProof', 'active', 'createdAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 160
+        && data.description is string && data.description.size() <= 500
+        && data.dueTime is string && data.dueTime.size() <= 20
+        && data.priority is string && data.priority in ['high', 'medium', 'low']
+        && data.recurrence is string && data.recurrence in ['daily', 'weekly', 'monthly']
+        && data.requiresProof is bool
+        && data.active is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidTask(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'responsibilityId', 'dateKey', 'title', 'description', 'dueTime', 'priority', 'recurrence', 'status', 'guardianApproved', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'responsibilityId', 'dateKey', 'title', 'description', 'dueTime', 'priority', 'recurrence', 'status', 'completedAt', 'proofImageDataUrl', 'guardianApproved', 'guardianApprovedBy', 'notes', 'createdAt', 'updatedAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.responsibilityId is string && data.responsibilityId.size() <= 128
+        && isValidDateKey(data.dateKey)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 160
+        && data.description is string && data.description.size() <= 500
+        && data.dueTime is string && data.dueTime.size() <= 20
+        && data.priority is string && data.priority in ['high', 'medium', 'low']
+        && data.recurrence is string && data.recurrence in ['daily', 'weekly', 'monthly']
+        && data.status is string && data.status in ['pending', 'completed', 'partial', 'missed']
+        && isOptionalString(data, 'completedAt', 64)
+        && isOptionalString(data, 'proofImageDataUrl', 200000)
+        && data.guardianApproved is bool
+        && isOptionalString(data, 'guardianApprovedBy', 120)
+        && data.notes is string && data.notes.size() <= 1000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidReward(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'title', 'description', 'category', 'costPoints', 'redeemed', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'title', 'description', 'category', 'costPoints', 'redeemed', 'redeemedAt', 'createdAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
+        && data.description is string && data.description.size() <= 400
+        && data.category is string && data.category.size() <= 60
+        && data.costPoints is int && data.costPoints >= 1 && data.costPoints <= 100000
+        && data.redeemed is bool
+        && isOptionalString(data, 'redeemedAt', 64)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAchievement(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'badgeKey', 'title', 'description', 'pointsBonus', 'earnedAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'badgeKey', 'title', 'description', 'pointsBonus', 'earnedAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.badgeKey is string && data.badgeKey.size() >= 1 && data.badgeKey.size() <= 64
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+        && data.description is string && data.description.size() <= 300
+        && data.pointsBonus is int && data.pointsBonus >= 0 && data.pointsBonus <= 5000
+        && data.earnedAt is timestamp;
+    }
+
+    function isValidAIInsight(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'dateKey', 'period', 'summary', 'strongestAxis', 'improvementAxis', 'recurringPatterns', 'studyConsistency', 'responsibilityFollowup', 'prayerSummary', 'performanceDelta', 'recommendations', 'status', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'dateKey', 'period', 'summary', 'strongestAxis', 'improvementAxis', 'recurringPatterns', 'studyConsistency', 'responsibilityFollowup', 'prayerSummary', 'performanceDelta', 'recommendations', 'status', 'approvedBy', 'createdAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && isValidDateKey(data.dateKey)
+        && data.period is string && data.period in ['daily', 'weekly', 'monthly']
+        && data.summary is string && data.summary.size() <= 2000
+        && data.strongestAxis is string && data.strongestAxis.size() <= 120
+        && data.improvementAxis is string && data.improvementAxis.size() <= 120
+        && data.recurringPatterns is string && data.recurringPatterns.size() <= 1000
+        && data.studyConsistency is string && data.studyConsistency.size() <= 1000
+        && data.responsibilityFollowup is string && data.responsibilityFollowup.size() <= 1000
+        && data.prayerSummary is string && data.prayerSummary.size() <= 1000
+        && data.performanceDelta is string && data.performanceDelta.size() <= 1000
+        && data.recommendations is list && data.recommendations.size() <= 10
+        && (data.recommendations.size() == 0 || (data.recommendations[0] is string && data.recommendations[0].size() <= 400))
+        && data.status is string && data.status in ['pending_review', 'approved', 'rejected']
+        && isOptionalString(data, 'approvedBy', 120)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidReport(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'reportType', 'periodStart', 'periodEnd', 'averageScore', 'axisAverages', 'highlights', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'reportType', 'periodStart', 'periodEnd', 'averageScore', 'axisAverages', 'highlights', 'createdAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.reportType is string && data.reportType in ['daily', 'weekly', 'monthly']
+        && isValidDateKey(data.periodStart)
+        && isValidDateKey(data.periodEnd)
+        && (data.averageScore is int || data.averageScore is float) && data.averageScore >= 0 && data.averageScore <= 10
+        && data.axisAverages is map
+        && data.axisAverages.keys().hasAll(['obedience', 'study', 'prayer', 'responsibilities'])
+        && data.axisAverages.keys().hasOnly(['obedience', 'study', 'prayer', 'responsibilities'])
+        && data.highlights is string && data.highlights.size() <= 2000
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAuditLog(data, userId, profileId) {
+      return data.keys().hasAll(['ownerId', 'profileId', 'action', 'entityType', 'entityId', 'actorName', 'reason', 'details', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'profileId', 'action', 'entityType', 'entityId', 'actorName', 'reason', 'details', 'createdAt'])
+        && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.profileId == profileId
+        && data.action is string && data.action.size() >= 1 && data.action.size() <= 80
+        && data.entityType is string && data.entityType.size() >= 1 && data.entityType.size() <= 80
+        && data.entityId is string && data.entityId.size() >= 1 && data.entityId.size() <= 128
+        && data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 120
+        && data.reason is string && data.reason.size() <= 500
+        && data.details is string && data.details.size() <= 1000
+        && data.createdAt is timestamp;
+    }
+
+    // --- Collection Match Rules ---
+
+    // Admin lookup (read-only for own record)
+    match /admins/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list, create, update, delete: if false;
+    }
+
+    // Users (PII isolated: list is forbidden, get/create/update strictly owner-only)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().role == existing().role
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'preferredLanguage', 'theme', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['pinEnabled', 'pinHash', 'updatedAt'])
+        );
+      allow delete: if false;
+
+      // Monitored Profiles
+      match /profiles/{profileId} {
+        allow get: if isValidId(userId) && isValidId(profileId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(profileId)
+          && isOwner(userId)
+          && isValidProfile(incoming(), userId)
+          && userExists(userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(profileId)
+          && isOwner(userId)
+          && isValidProfile(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'age', 'city', 'country', 'latitude', 'longitude', 'avatarColor', 'prayerAlertsEnabled', 'dailyGoalMinutes', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['weights', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['activeStreak', 'totalPoints', 'totalStars', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId) && isValidId(profileId) && isOwner(userId);
+
+        // Behavior Categories
+        match /behaviorCategories/{categoryId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(categoryId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(categoryId)
+            && isOwner(userId)
+            && isValidBehaviorCategory(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().updatedAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidId(categoryId)
+            && isOwner(userId)
+            && isValidBehaviorCategory(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().key == existing().key
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'weight', 'subCriteria', 'updatedAt']);
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(categoryId) && isOwner(userId);
+        }
+
+        // Daily Assessments
+        match /dailyAssessments/{dateKey} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidDateKey(dateKey) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidDateKey(dateKey)
+            && isOwner(userId)
+            && isValidDailyAssessment(incoming(), userId, profileId, dateKey)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time
+            && incoming().updatedAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidDateKey(dateKey)
+            && isOwner(userId)
+            && isValidDailyAssessment(incoming(), userId, profileId, dateKey)
+            && profileOwnedBy(userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().dateKey == existing().dateKey
+            && incoming().createdAt == existing().createdAt
+            && incoming().updatedAt == request.time
+            && (
+              // Action 1: Draft or finalizing assessment
+              (existing().status == 'draft' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'axisStates', 'scores', 'dailyEvents', 'endOfDaySummary', 'updatedAt'])) ||
+              // Action 2: Audited manual score override (allowed even when finalized, requires reason & modifiedBy)
+              (
+                'manualOverride' in incoming()
+                && incoming().manualOverride.isOverridden == true
+                && incoming().manualOverride.reason.size() >= 3
+                && incoming().manualOverride.modifiedBy.size() >= 2
+                && incoming().diff(existing()).affectedKeys().hasOnly(['scores', 'manualOverride', 'updatedAt'])
+              ) ||
+              // Action 3: Reopen finalized assessment to draft or update notes with override
+              (existing().status == 'finalized' && incoming().status == 'draft' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+            );
+          allow delete: if false;
+        }
+
+        // Axis 1: Listening & Obedience Observations
+        match /observations/{obsId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(obsId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(obsId)
+            && isOwner(userId)
+            && isValidObservation(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidId(obsId)
+            && isOwner(userId)
+            && isValidObservation(incoming(), userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().createdAt == existing().createdAt
+            && incoming().diff(existing()).affectedKeys().hasOnly(['situation', 'guidanceGiven', 'reaction', 'outcome', 'firstTimeResponse', 'neededReminder', 'criterionKey', 'isPoliteQuestion', 'pointsAwarded', 'notes']);
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(obsId) && isOwner(userId);
+        }
+
+        // Axis 2: Study Sessions
+        match /studySessions/{sessionId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(sessionId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(sessionId)
+            && isOwner(userId)
+            && isValidStudySession(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidId(sessionId)
+            && isOwner(userId)
+            && isValidStudySession(incoming(), userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().createdAt == existing().createdAt
+            && incoming().diff(existing()).affectedKeys().hasOnly(['subject', 'goalDescription', 'targetMinutes', 'startTime', 'endTime', 'actualMinutes', 'activityType', 'focusLevel', 'qualityRating', 'status', 'postponeReason', 'notes']);
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(sessionId) && isOwner(userId);
+        }
+
+        // Axis 3: Prayer Records (strictly private to owner)
+        match /prayerRecords/{dateKey} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidDateKey(dateKey) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidDateKey(dateKey)
+            && isOwner(userId)
+            && isValidPrayerRecord(incoming(), userId, profileId, dateKey)
+            && profileOwnedBy(userId, profileId)
+            && incoming().updatedAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidDateKey(dateKey)
+            && isOwner(userId)
+            && isValidPrayerRecord(incoming(), userId, profileId, dateKey)
+            && profileOwnedBy(userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().dateKey == existing().dateKey
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['prayers', 'updatedAt']);
+          allow delete: if false;
+        }
+
+        // Axis 4: Responsibilities (Templates)
+        match /responsibilities/{respId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(respId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(respId)
+            && isOwner(userId)
+            && isValidResponsibility(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidId(respId)
+            && isOwner(userId)
+            && isValidResponsibility(incoming(), userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().createdAt == existing().createdAt
+            && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'dueTime', 'priority', 'recurrence', 'requiresProof', 'active']);
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(respId) && isOwner(userId);
+        }
+
+        // Axis 4: Daily Tasks
+        match /tasks/{taskId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(taskId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(taskId)
+            && isOwner(userId)
+            && isValidTask(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time
+            && incoming().updatedAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidId(taskId)
+            && isOwner(userId)
+            && isValidTask(incoming(), userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().createdAt == existing().createdAt
+            && incoming().updatedAt == request.time
+            && (
+              // Action 1: Progress update (child or guardian)
+              incoming().diff(existing()).affectedKeys().hasOnly(['status', 'completedAt', 'proofImageDataUrl', 'notes', 'updatedAt']) ||
+              // Action 2: Guardian approval & verification
+              incoming().diff(existing()).affectedKeys().hasOnly(['guardianApproved', 'guardianApprovedBy', 'status', 'notes', 'updatedAt'])
+            );
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(taskId) && isOwner(userId);
+        }
+
+        // Rewards
+        match /rewards/{rewardId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(rewardId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(rewardId)
+            && isOwner(userId)
+            && isValidReward(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidId(rewardId)
+            && isOwner(userId)
+            && isValidReward(incoming(), userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().createdAt == existing().createdAt
+            && (
+              incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'category', 'costPoints']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['redeemed', 'redeemedAt'])
+            );
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(rewardId) && isOwner(userId);
+        }
+
+        // Achievements
+        match /achievements/{achId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(achId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(achId)
+            && isOwner(userId)
+            && isValidAchievement(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().earnedAt == request.time;
+          allow update, delete: if false;
+        }
+
+        // AI Insights & Improvement Plans
+        match /aiInsights/{insightId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(insightId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(insightId)
+            && isOwner(userId)
+            && isValidAIInsight(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time;
+          allow update: if isValidId(userId) && isValidId(profileId) && isValidId(insightId)
+            && isOwner(userId)
+            && isValidAIInsight(incoming(), userId, profileId)
+            && incoming().ownerId == existing().ownerId
+            && incoming().profileId == existing().profileId
+            && incoming().createdAt == existing().createdAt
+            && existing().status == 'pending_review'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approvedBy']);
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(insightId) && isOwner(userId);
+        }
+
+        // Saved Reports
+        match /reports/{reportId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(reportId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(reportId)
+            && isOwner(userId)
+            && isValidReport(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time;
+          allow update: if false;
+          allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(reportId) && isOwner(userId);
+        }
+
+        // Immutable Audit Logs
+        match /auditLogs/{logId} {
+          allow get: if isValidId(userId) && isValidId(profileId) && isValidId(logId) && isOwner(userId);
+          allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(userId) && isValidId(profileId) && isValidId(logId)
+            && isOwner(userId)
+            && isValidAuditLog(incoming(), userId, profileId)
+            && profileOwnedBy(userId, profileId)
+            && incoming().createdAt == request.time;
+          allow update, delete: if false;
+        }
+      }
+    }
+  }
+}

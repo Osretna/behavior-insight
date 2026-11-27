@@ -29,9 +29,21 @@ import {
   evaluateAndSyncProfileRewards,
   subscribeProfileCollection,
   subscribeProfiles,
+  subscribeSubscriptionSettings,
+  subscribeUserAccount,
   syncComputedAssessmentForDate,
   updateUserPreferences,
 } from './lib/firestoreService';
+import {
+  verifyStoredDeviceTokens,
+  type SignedDeviceGrantPayload,
+  type SignedDeviceSettingsPayload,
+} from './lib/apiClient';
+import {
+  evaluateSubscriptionAccess,
+  getDeviceGrantTokensList,
+  getDeviceSettingsToken,
+} from './lib/subscription';
 import { buildEffectiveAssessments, getTodayDateKey } from './lib/scoring';
 import type {
   Achievement,
@@ -48,11 +60,14 @@ import type {
   Responsibility,
   Reward,
   StudySession,
+  SubscriptionSettings,
   TaskItem,
   UserAccount,
 } from './types/behavior';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { AuthGate } from './components/AuthGate';
+import { AdminDashboardModal } from './components/AdminDashboardModal';
+import { SubscriptionBlockedScreen } from './components/SubscriptionBlockedScreen';
 import { ProfileSetupModal } from './components/ProfileSetupModal';
 import { ProfileManagerModal } from './components/ProfileManagerModal';
 import { GuardianPinModal } from './components/GuardianPinModal';
@@ -89,6 +104,13 @@ function MainApp() {
   const [profileManagerOpen, setProfileManagerOpen] = useState(false);
   const [pinModalOpen, setPinModalOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+
+  // Admin & Subscription Control State
+  const [adminModalOpen, setAdminModalOpen] = useState(false);
+  const [cloudSettings, setCloudSettings] = useState<SubscriptionSettings | null>(null);
+  const [verifiedGrants, setVerifiedGrants] = useState<SignedDeviceGrantPayload[]>([]);
+  const [verifiedSettings, setVerifiedSettings] = useState<SignedDeviceSettingsPayload | null>(null);
+  const [deviceGrantSyncTick, setDeviceGrantSyncTick] = useState(0);
 
   // Active Profile Subcollections
   const [categories, setCategories] = useState<BehaviorCategory[]>([]);
@@ -206,9 +228,70 @@ function MainApp() {
     };
   }, [user, profilesRetryTick]);
 
+  // Verify any server-signed device subscription grants & settings stored on this phone
+  useEffect(() => {
+    let active = true;
+    const grantTokens = getDeviceGrantTokensList();
+    const settingsToken = getDeviceSettingsToken();
+    if (grantTokens.length === 0 && !settingsToken) {
+      setVerifiedGrants([]);
+      setVerifiedSettings(null);
+      return;
+    }
+    verifyStoredDeviceTokens(grantTokens, settingsToken)
+      .then((res) => {
+        if (!active) return;
+        setVerifiedGrants(res.grants);
+        setVerifiedSettings(res.settings);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [deviceGrantSyncTick]);
+
+  // Real-time listeners for current user's subscription state & global WhatsApp/price settings
+  useEffect(() => {
+    if (!user) {
+      setCloudSettings(null);
+      return;
+    }
+    const unsubAccount = subscribeUserAccount(user.uid, (acc) => {
+      if (acc) setUserAccount(acc);
+    });
+    const unsubSettings = subscribeSubscriptionSettings((s) => {
+      setCloudSettings(s);
+    });
+    return () => {
+      unsubAccount();
+      unsubSettings();
+    };
+  }, [user]);
+
   const activeProfile = useMemo(
     () => profiles.find((p) => p.id === activeProfileId) || null,
     [profiles, activeProfileId]
+  );
+
+  const matchingDeviceGrant = useMemo(
+    () => (user ? verifiedGrants.find((g) => g.uid === user.uid) || null : null),
+    [user, verifiedGrants]
+  );
+
+  const effectiveSubscriptionSettings = useMemo(
+    () => cloudSettings || verifiedSettings,
+    [cloudSettings, verifiedSettings]
+  );
+
+  const subscriptionAccess = useMemo(
+    () =>
+      evaluateSubscriptionAccess({
+        email: user?.email,
+        account: userAccount,
+        deviceGrant: matchingDeviceGrant,
+        settings: effectiveSubscriptionSettings,
+      }),
+    [user?.email, userAccount, matchingDeviceGrant, effectiveSubscriptionSettings]
   );
 
   // Instant 0ms automatic evaluation computed from all entered records across all dates
@@ -319,94 +402,110 @@ function MainApp() {
     rewards,
   ]);
 
-  if (!authReady) {
-    return (
-      <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120]">
-        <div className="flex flex-col items-center gap-3">
-          <IslamicEmblem size={48} />
-          <p className="text-sm text-slate-500 dark:text-slate-400">جاري تهيئة BEHAVIOR INSIGHT...</p>
+  const renderStage = (): React.ReactNode => {
+    if (!authReady) {
+      return (
+        <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120]">
+          <div className="flex flex-col items-center gap-3">
+            <IslamicEmblem size={48} />
+            <p className="text-sm text-slate-500 dark:text-slate-400">جاري تهيئة BEHAVIOR INSIGHT...</p>
+          </div>
         </div>
-      </div>
-    );
-  }
+      );
+    }
 
-  if (!user) {
-    return (
-      <AuthGate
-        initialError={authError}
-        onSignedIn={(signedInUser) => {
-          setAuthError(null);
-          setUser(signedInUser);
-        }}
-      />
-    );
-  }
+    if (!user) {
+      return (
+        <AuthGate
+          initialError={authError}
+          onSignedIn={(signedInUser) => {
+            setAuthError(null);
+            setUser(signedInUser);
+          }}
+          onTriggerAdmin={() => setAdminModalOpen(true)}
+        />
+      );
+    }
 
-  if (!profilesLoaded) {
-    return (
-      <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120] p-6">
-        <div className="flex flex-col items-center gap-3 text-center">
-          <IslamicEmblem size={44} />
-          <p className="text-sm text-slate-600 dark:text-slate-300 font-medium">جاري تحميل قائمة الأسماء والملفات الشخصية...</p>
+    if (!subscriptionAccess.allowed) {
+      return (
+        <SubscriptionBlockedScreen
+          userEmail={user.email || userAccount?.email || ''}
+          displayName={userAccount?.displayName || user.displayName || 'مستخدم'}
+          access={subscriptionAccess}
+          whatsappNumber={effectiveSubscriptionSettings?.whatsappNumber || ''}
+          currency={effectiveSubscriptionSettings?.currency || 'ج.م'}
+          onSignOut={() => signOut(auth)}
+          onTriggerAdmin={() => setAdminModalOpen(true)}
+        />
+      );
+    }
+
+    if (!profilesLoaded) {
+      return (
+        <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120] p-6">
+          <div className="flex flex-col items-center gap-3 text-center">
+            <IslamicEmblem size={44} />
+            <p className="text-sm text-slate-600 dark:text-slate-300 font-medium">جاري تحميل قائمة الأسماء والملفات الشخصية...</p>
+          </div>
         </div>
-      </div>
-    );
-  }
+      );
+    }
 
-  if (profilesError && profiles.length === 0) {
-    return (
-      <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120] p-6">
-        <div className="max-w-md w-full rounded-3xl bg-white dark:bg-[#0D192D] border border-slate-200 dark:border-slate-800 p-7 text-center space-y-4 shadow-xl">
-          <IslamicEmblem size={48} />
-          <h2 className="text-lg font-bold text-slate-900 dark:text-white">تعذر تحميل الملفات الشخصية</h2>
-          <p className="text-xs text-rose-600 dark:text-rose-400 leading-relaxed bg-rose-500/10 border border-rose-500/20 rounded-xl p-3">
-            {profilesError}
-          </p>
-          <div className="flex flex-wrap items-center justify-center gap-2.5">
+    if (profilesError && profiles.length === 0) {
+      return (
+        <div dir="rtl" className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#071120] p-6">
+          <div className="max-w-md w-full rounded-3xl bg-white dark:bg-[#0D192D] border border-slate-200 dark:border-slate-800 p-7 text-center space-y-4 shadow-xl">
+            <IslamicEmblem size={48} />
+            <h2 className="text-lg font-bold text-slate-900 dark:text-white">تعذر تحميل الملفات الشخصية</h2>
+            <p className="text-xs text-rose-600 dark:text-rose-400 leading-relaxed bg-rose-500/10 border border-rose-500/20 rounded-xl p-3">
+              {profilesError}
+            </p>
+            <div className="flex flex-wrap items-center justify-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setProfilesLoaded(false);
+                  setProfilesError(null);
+                  setProfilesRetryTick((t) => t + 1);
+                }}
+                className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold inline-flex items-center gap-2 cursor-pointer"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>إعادة المحاولة</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setProfilesError(null)}
+                className="min-h-[44px] px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-2 cursor-pointer"
+              >
+                <UserPlus className="w-4 h-4" />
+                <span>إضافة ملف جديد</span>
+              </button>
+            </div>
             <button
               type="button"
-              onClick={() => {
-                setProfilesLoaded(false);
-                setProfilesError(null);
-                setProfilesRetryTick((t) => t + 1);
-              }}
-              className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold inline-flex items-center gap-2 cursor-pointer"
+              onClick={() => signOut(auth)}
+              className="text-xs text-slate-500 hover:text-rose-500 underline cursor-pointer"
             >
-              <RefreshCw className="w-4 h-4" />
-              <span>إعادة المحاولة</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setProfilesError(null)}
-              className="min-h-[44px] px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-2 cursor-pointer"
-            >
-              <UserPlus className="w-4 h-4" />
-              <span>إضافة ملف جديد</span>
+              تبديل حساب Gmail
             </button>
           </div>
-          <button
-            type="button"
-            onClick={() => signOut(auth)}
-            className="text-xs text-slate-500 hover:text-rose-500 underline cursor-pointer"
-          >
-            تبديل حساب Gmail
-          </button>
         </div>
-      </div>
-    );
-  }
+      );
+    }
 
-  if (profiles.length === 0 || !activeProfile) {
-    return (
-      <ProfileSetupModal
-        uid={user.uid}
-        onCreated={(id) => {
-          setProfilesError(null);
-          setActiveProfileId(id);
-        }}
-      />
-    );
-  }
+    if (profiles.length === 0 || !activeProfile) {
+      return (
+        <ProfileSetupModal
+          uid={user.uid}
+          onCreated={(id) => {
+            setProfilesError(null);
+            setActiveProfileId(id);
+          }}
+        />
+      );
+    }
 
   const handleToggleMode = () => {
     if (appMode === 'guardian') {
@@ -917,6 +1016,21 @@ function MainApp() {
 
       <OfflineIndicator />
     </div>
+    );
+  };
+
+  return (
+    <>
+      {renderStage()}
+      <AdminDashboardModal
+        isOpen={adminModalOpen}
+        onClose={() => setAdminModalOpen(false)}
+        verifiedGrants={verifiedGrants}
+        verifiedSettings={verifiedSettings}
+        cloudSettings={cloudSettings}
+        onDeviceDataChanged={() => setDeviceGrantSyncTick((t) => t + 1)}
+      />
+    </>
   );
 }
 

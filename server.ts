@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import path from 'node:path';
 import express, { type Request, type Response } from 'express';
-import apiApp from './server/apiApp';
+import apiApp from './server/apiApp.js';
 
 const PORT = 3000;
 

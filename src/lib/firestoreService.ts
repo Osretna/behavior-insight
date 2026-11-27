@@ -35,9 +35,12 @@ import {
   type Responsibility,
   type Reward,
   type StudySession,
+  type SubscriptionSettings,
+  type SubscriptionStatus,
   type TaskItem,
   type UserAccount,
 } from '../types/behavior';
+import { getDeviceSummary, recordDeviceUser } from './subscription';
 import {
   calculateStreak,
   clampScore,
@@ -91,13 +94,25 @@ function sortByField<T extends Record<string, unknown>>(
   });
 }
 
-// --- User Account ---
+// --- User Account & Subscription ---
 export async function ensureUserAccount(user: User): Promise<UserAccount> {
   const userPath = `users/${user.uid}`;
   const userRef = doc(db, 'users', user.uid);
+  const email = trunc(user.email || 'user@example.com', 254);
+  const displayName = trunc(user.displayName || 'ولي الأمر', 120);
+
+  recordDeviceUser({ uid: user.uid, email, displayName });
+
   try {
     const snap = await getDoc(userRef);
     if (snap.exists()) {
+      // Update login timestamp & device metadata silently without overwriting subscription fields
+      updateDoc(userRef, {
+        displayName,
+        lastLoginAt: new Date().toISOString(),
+        deviceInfo: trunc(getDeviceSummary(), 200),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {});
       return snap.data() as UserAccount;
     }
     const newUser: Omit<UserAccount, 'createdAt' | 'updatedAt'> & {
@@ -105,12 +120,15 @@ export async function ensureUserAccount(user: User): Promise<UserAccount> {
       updatedAt: ReturnType<typeof serverTimestamp>;
     } = {
       uid: user.uid,
-      email: trunc(user.email || 'user@example.com', 254),
-      displayName: trunc(user.displayName || 'ولي الأمر', 120),
+      email,
+      displayName,
       role: 'guardian',
       preferredLanguage: 'ar',
       theme: 'dark',
       pinEnabled: false,
+      subscriptionStatus: 'active',
+      lastLoginAt: new Date().toISOString(),
+      deviceInfo: trunc(getDeviceSummary(), 200),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     };
@@ -122,6 +140,115 @@ export async function ensureUserAccount(user: User): Promise<UserAccount> {
     };
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, userPath);
+  }
+}
+
+export function subscribeUserAccount(
+  uid: string,
+  onData: (account: UserAccount | null) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  const path = `users/${uid}`;
+  return onSnapshot(
+    doc(db, 'users', uid),
+    (snapshot) => {
+      onData(snapshot.exists() ? (snapshot.data() as UserAccount) : null);
+    },
+    (error) => {
+      if (onError) {
+        onError(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      console.warn(`subscribeUserAccount(${path}) warning:`, error.message);
+    }
+  );
+}
+
+export function subscribeAllUsers(
+  onData: (users: UserAccount[]) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  return onSnapshot(
+    collection(db, 'users'),
+    (snapshot) => {
+      const list = snapshot.docs.map((d) => d.data() as UserAccount);
+      onData(
+        sortByField(
+          list as unknown as Array<UserAccount & Record<string, unknown>>,
+          'updatedAt',
+          'desc'
+        ) as unknown as UserAccount[]
+      );
+    },
+    (error) => {
+      if (onError) {
+        onError(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      handleFirestoreError(error, OperationType.LIST, 'users');
+    }
+  );
+}
+
+export async function updateUserSubscription(
+  uid: string,
+  payload: {
+    subscriptionStatus: SubscriptionStatus;
+    validFrom: string;
+    validUntil: string;
+    subscriptionPlanLabel: string;
+    subscriptionPrice: number;
+  }
+): Promise<void> {
+  const path = `users/${uid}`;
+  try {
+    await updateDoc(doc(db, 'users', uid), {
+      subscriptionStatus: payload.subscriptionStatus,
+      validFrom: /^\d{4}-\d{2}-\d{2}$/.test(payload.validFrom) ? payload.validFrom : '',
+      validUntil: /^\d{4}-\d{2}-\d{2}$/.test(payload.validUntil) ? payload.validUntil : '',
+      subscriptionPlanLabel: trunc(payload.subscriptionPlanLabel, 80),
+      subscriptionPrice: Math.min(1000000, Math.max(0, Number(payload.subscriptionPrice) || 0)),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export function subscribeSubscriptionSettings(
+  onData: (settings: SubscriptionSettings | null) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  return onSnapshot(
+    doc(db, 'appSettings', 'subscription'),
+    (snapshot) => {
+      onData(snapshot.exists() ? (snapshot.data() as SubscriptionSettings) : null);
+    },
+    (error) => {
+      if (onError) {
+        onError(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      console.warn('subscribeSubscriptionSettings warning:', error.message);
+    }
+  );
+}
+
+export async function updateSubscriptionSettings(payload: {
+  whatsappNumber: string;
+  defaultMonthlyPrice: number;
+  currency: string;
+}): Promise<void> {
+  const path = 'appSettings/subscription';
+  try {
+    await setDoc(doc(db, 'appSettings', 'subscription'), {
+      whatsappNumber: trunc(payload.whatsappNumber.replace(/[^\d+]/g, ''), 24),
+      defaultMonthlyPrice: Math.min(1000000, Math.max(0, Number(payload.defaultMonthlyPrice) || 0)),
+      currency: trunc(payload.currency.trim() || 'ج.م', 16),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 

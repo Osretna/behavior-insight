@@ -8,15 +8,33 @@ import { PWAInstallButton } from './PWAInstallButton';
 export function AuthGate({
   initialError = null,
   onSignedIn,
+  onTriggerAdmin,
 }: {
   initialError?: string | null;
   onSignedIn?: (user: User) => void;
+  onTriggerAdmin?: () => void;
 }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(initialError);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [popupBlocked, setPopupBlocked] = useState(false);
   const signingInRef = useRef(false);
+  const tapCountRef = useRef(0);
+  const lastTapRef = useRef(0);
+
+  const handleLogoTap = () => {
+    const now = Date.now();
+    if (now - lastTapRef.current > 1500) {
+      tapCountRef.current = 1;
+    } else {
+      tapCountRef.current += 1;
+    }
+    lastTapRef.current = now;
+    if (tapCountRef.current >= 3) {
+      tapCountRef.current = 0;
+      onTriggerAdmin?.();
+    }
+  };
 
   useEffect(() => {
     try {
@@ -102,7 +120,7 @@ export function AuthGate({
       <IslamicGeometricHeaderBackdrop />
 
       <div className="relative z-10 max-w-md w-full rounded-3xl border border-white/10 bg-[#0B172A]/92 backdrop-blur-xl p-7 sm:p-9 shadow-2xl text-center space-y-6">
-        <div className="flex flex-col items-center gap-3">
+        <div className="flex flex-col items-center gap-3 select-none" onClick={handleLogoTap}>
           <div className="w-16 h-16 rounded-2xl overflow-hidden shadow-lg shadow-emerald-950/60 border border-amber-400/25">
             <img
               src="/pwa-192x192.png"

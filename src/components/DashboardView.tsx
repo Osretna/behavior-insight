@@ -46,6 +46,7 @@ import {
 } from './Charts';
 import { IslamicGeometricHeaderBackdrop } from './IslamicDecor';
 import { QuickEvaluatePanel, type QuickEvalTab } from './QuickEvaluatePanel';
+import { generateLocalBehaviorAnalysis } from '../lib/localAiEngine';
 
 export function DashboardView({
   uid,
@@ -155,6 +156,22 @@ export function DashboardView({
   const inspectedAssessment = inspectedDateKey
     ? assessments.find((a) => a.dateKey === inspectedDateKey)
     : null;
+
+  const autoAiPulse = useMemo(
+    () =>
+      generateLocalBehaviorAnalysis({
+        profileName: profile.name,
+        profileAge: profile.age,
+        period: 'weekly',
+        dateKey: todayKey,
+        assessments,
+        observations,
+        studySessions,
+        prayerRecords,
+        tasks,
+      }),
+    [profile.name, profile.age, todayKey, assessments, observations, studySessions, prayerRecords, tasks]
+  );
 
   const jumpToQuickEval = (subTab: QuickEvalTab) => {
     setEvalSubTab(subTab);
@@ -558,6 +575,53 @@ export function DashboardView({
             days={35}
             onSelectDate={setInspectedDateKey}
           />
+        </div>
+      </section>
+
+      {/* Automatic Zero-API Smart AI Pulse Card */}
+      <section className="p-5 sm:p-6 rounded-2xl bg-white dark:bg-[#0D192D] border border-emerald-500/30 shadow-sm space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+              <Sparkles className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-sm sm:text-base text-slate-900 dark:text-white">
+                التحليل الذكي التلقائي لـ {profile.name} (يعمل مباشرة دون API)
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                يتحدث تلقائياً لحظة بلحظة بناءً على ما يتم إدخاله من سجلات
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => onNavigate('ai')}
+            className="min-h-[38px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+          >
+            <span>عرض التحليل الكامل</span>
+            <ArrowLeft className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <p className="text-xs sm:text-sm text-slate-700 dark:text-slate-200 leading-relaxed">
+          {autoAiPulse.summary}
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+            <div className="font-bold text-emerald-700 dark:text-emerald-300 mb-0.5">نقطة القوة</div>
+            <div className="text-slate-700 dark:text-slate-200">{autoAiPulse.strongestAxis}</div>
+          </div>
+          <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
+            <div className="font-bold text-amber-700 dark:text-amber-300 mb-0.5">فرصة التحسين</div>
+            <div className="text-slate-700 dark:text-slate-200">{autoAiPulse.improvementAxis}</div>
+          </div>
+          <div className="p-3 rounded-xl bg-slate-100 dark:bg-slate-900/70">
+            <div className="font-bold text-slate-800 dark:text-slate-200 mb-0.5">توصية تلقائية</div>
+            <div className="text-slate-600 dark:text-slate-300">{autoAiPulse.recommendations[0]}</div>
+          </div>
         </div>
       </section>
 

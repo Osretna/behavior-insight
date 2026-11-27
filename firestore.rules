@@ -22,6 +22,14 @@ service cloud.firestore {
       return isVerifiedUser() && request.auth.uid == userId;
     }
 
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'nesmanagah53@gmail.com' ||
+        request.auth.token.email == 's.mohamed1111111@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
     function isValidId(id) {
       return id is string
         && id.size() >= 1
@@ -49,6 +57,12 @@ service cloud.firestore {
 
     function isOptionalNumber(data, key) {
       return !(key in data) || (data[key] is int || data[key] is float);
+    }
+
+    function isOptionalDateOrEmpty(data, key) {
+      return !(key in data) || (
+        data[key] is string && (data[key] == '' || isValidDateKey(data[key]))
+      );
     }
 
     function isValidScoreValue(val) {
@@ -93,8 +107,26 @@ service cloud.firestore {
     // --- Validation Blueprints (Pillar 2) ---
     function isValidUserAccount(data, userId) {
       return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'preferredLanguage', 'theme', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'preferredLanguage', 'theme', 'pinEnabled', 'pinHash', 'createdAt', 'updatedAt'])
-        && isValidId(data.uid) && data.uid == userId && data.uid == request.auth.uid
+        && data.keys().hasOnly([
+          'uid',
+          'email',
+          'displayName',
+          'role',
+          'preferredLanguage',
+          'theme',
+          'pinEnabled',
+          'pinHash',
+          'subscriptionStatus',
+          'validFrom',
+          'validUntil',
+          'subscriptionPlanLabel',
+          'subscriptionPrice',
+          'lastLoginAt',
+          'deviceInfo',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.uid) && data.uid == userId
         && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
         && data.role == 'guardian'
@@ -102,7 +134,24 @@ service cloud.firestore {
         && data.theme is string && data.theme in ['dark', 'light']
         && (!('pinEnabled' in data) || data.pinEnabled is bool)
         && isOptionalString(data, 'pinHash', 256)
+        && (!('subscriptionStatus' in data) || (data.subscriptionStatus is string && data.subscriptionStatus in ['active', 'suspended']))
+        && isOptionalDateOrEmpty(data, 'validFrom')
+        && isOptionalDateOrEmpty(data, 'validUntil')
+        && isOptionalString(data, 'subscriptionPlanLabel', 80)
+        && (!('subscriptionPrice' in data) || ((data.subscriptionPrice is int || data.subscriptionPrice is float) && data.subscriptionPrice >= 0 && data.subscriptionPrice <= 1000000))
+        && isOptionalString(data, 'lastLoginAt', 64)
+        && isOptionalString(data, 'deviceInfo', 200)
         && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSubscriptionSettings(data) {
+      return data.keys().hasAll(['whatsappNumber', 'defaultMonthlyPrice', 'currency', 'updatedAt'])
+        && data.keys().hasOnly(['whatsappNumber', 'defaultMonthlyPrice', 'currency', 'updatedAt'])
+        && data.whatsappNumber is string && data.whatsappNumber.size() <= 24
+        && (data.defaultMonthlyPrice is int || data.defaultMonthlyPrice is float)
+        && data.defaultMonthlyPrice >= 0 && data.defaultMonthlyPrice <= 1000000
+        && data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16
         && data.updatedAt is timestamp;
     }
 
@@ -358,25 +407,61 @@ service cloud.firestore {
       allow list, create, update, delete: if false;
     }
 
-    // Users (PII isolated: list is forbidden, get/create/update strictly owner-only)
-    match /users/{userId} {
-      allow get: if isValidId(userId) && isOwner(userId);
+    // Global App Settings (WhatsApp support number & monthly subscription defaults)
+    match /appSettings/{settingId} {
+      allow get: if isSignedIn() && settingId == 'subscription';
       allow list: if false;
+      allow create, update: if isAdmin()
+        && settingId == 'subscription'
+        && isValidSubscriptionSettings(incoming())
+        && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Users (Owner-isolated with Admin remote management support)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
       allow create: if isValidId(userId)
         && isOwner(userId)
         && isValidUserAccount(incoming(), userId)
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+        && incoming().updatedAt == request.time
+        && (!('subscriptionStatus' in incoming()) || incoming().subscriptionStatus == 'active')
+        && !('validFrom' in incoming())
+        && !('validUntil' in incoming())
+        && !('subscriptionPlanLabel' in incoming())
+        && !('subscriptionPrice' in incoming());
       allow update: if isValidId(userId)
-        && isOwner(userId)
         && isValidUserAccount(incoming(), userId)
         && incoming().uid == existing().uid
         && incoming().role == existing().role
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'preferredLanguage', 'theme', 'updatedAt']) ||
-          incoming().diff(existing()).affectedKeys().hasOnly(['pinEnabled', 'pinHash', 'updatedAt'])
+          // Tier 1: Owner updating profile preferences, PIN, or device metadata (cannot touch subscription fields)
+          (
+            isOwner(userId)
+            && incoming().email == existing().email
+            && (
+              incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'preferredLanguage', 'theme', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['pinEnabled', 'pinHash', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['lastLoginAt', 'deviceInfo', 'displayName', 'updatedAt'])
+            )
+          ) ||
+          // Tier 2: Admin managing user subscription status, valid dates, and pricing
+          (
+            isAdmin()
+            && incoming().email == existing().email
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'subscriptionStatus',
+              'validFrom',
+              'validUntil',
+              'subscriptionPlanLabel',
+              'subscriptionPrice',
+              'updatedAt'
+            ])
+          )
         );
       allow delete: if false;
 
@@ -444,9 +529,7 @@ service cloud.firestore {
             && incoming().createdAt == existing().createdAt
             && incoming().updatedAt == request.time
             && (
-              // Action 1: Draft or finalizing assessment
               (existing().status == 'draft' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'axisStates', 'scores', 'dailyEvents', 'endOfDaySummary', 'updatedAt'])) ||
-              // Action 2: Audited manual score override (allowed even when finalized, requires reason & modifiedBy)
               (
                 'manualOverride' in incoming()
                 && incoming().manualOverride.isOverridden == true
@@ -454,7 +537,6 @@ service cloud.firestore {
                 && incoming().manualOverride.modifiedBy.size() >= 2
                 && incoming().diff(existing()).affectedKeys().hasOnly(['scores', 'manualOverride', 'updatedAt'])
               ) ||
-              // Action 3: Reopen finalized assessment to draft
               (existing().status == 'finalized' && incoming().status == 'draft' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
             );
           allow delete: if false;
@@ -556,9 +638,7 @@ service cloud.firestore {
             && incoming().createdAt == existing().createdAt
             && incoming().updatedAt == request.time
             && (
-              // Action 1: Progress update (child or guardian)
               incoming().diff(existing()).affectedKeys().hasOnly(['status', 'completedAt', 'proofImageDataUrl', 'notes', 'updatedAt']) ||
-              // Action 2: Guardian approval & verification
               incoming().diff(existing()).affectedKeys().hasOnly(['guardianApproved', 'guardianApprovedBy', 'status', 'notes', 'updatedAt'])
             );
           allow delete: if isValidId(userId) && isValidId(profileId) && isValidId(taskId) && isOwner(userId);

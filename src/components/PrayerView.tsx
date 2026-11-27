@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Bell, Compass, Lock, MapPin, Moon, RefreshCw, Shield } from 'lucide-react';
+import { Bell, Compass, Globe2, Lock, MapPin, Moon, RefreshCw, Shield } from 'lucide-react';
 import {
   PRAYERS_META,
   type MonitoredProfile,
@@ -10,6 +10,11 @@ import {
 } from '../types/behavior';
 import { fetchPrayerTimes } from '../lib/apiClient';
 import { updateProfileDetails, upsertPrayerStatus } from '../lib/firestoreService';
+import {
+  detectUserLocationSmart,
+  KNOWN_LOCATIONS,
+  resolveKnownLocation,
+} from '../lib/locations';
 import { computePrayerScore, getOffsetDateKey, getTodayDateKey } from '../lib/scoring';
 import { ProgressRing, WeeklyBarChart } from './Charts';
 
@@ -36,6 +41,9 @@ export function PrayerView({
   });
   const [savingKey, setSavingKey] = useState<PrayerKey | null>(null);
   const [alertsMsg, setAlertsMsg] = useState<string | null>(null);
+  const [locationStatusMsg, setLocationStatusMsg] = useState<string | null>(null);
+  const [showCityPicker, setShowCityPicker] = useState(false);
+  const [citySearch, setCitySearch] = useState('');
 
   const currentRecord = prayerRecords.find((r) => r.dateKey === dateKey);
   const dayScore = computePrayerScore(currentRecord ?? null, 'unrated');
@@ -43,23 +51,46 @@ export function PrayerView({
   const loadTimes = async (useGeo = false) => {
     setLoadingTimes(true);
     setTimesError(null);
+    if (useGeo) setLocationStatusMsg(null);
+
     try {
-      if (useGeo && 'geolocation' in navigator) {
-        const pos = await new Promise<GeolocationPosition>((resolve, reject) =>
-          navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 7000 })
-        );
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        await updateProfileDetails(uid, profile.id, { latitude: lat, longitude: lng });
-        const data = await fetchPrayerTimes({ lat, lng });
+      if (useGeo) {
+        const detected = await detectUserLocationSmart();
+        await updateProfileDetails(uid, profile.id, {
+          latitude: detected.lat,
+          longitude: detected.lng,
+          city: detected.city,
+          country: detected.country,
+        });
+        const data = await fetchPrayerTimes({
+          lat: detected.lat,
+          lng: detected.lng,
+          city: detected.city,
+          country: detected.country,
+          method: detected.method,
+        });
         setPrayerTimes(data);
+        setLocationStatusMsg(
+          detected.source === 'gps'
+            ? `تم تحديد موقعك بدقة: ${detected.city} — ${detected.country}`
+            : `تم تحديد موقعك تقريبياً عبر الشبكة: ${detected.city} — ${detected.country} (يمكنك تغيير المحافظة يدوياً إذا أردت)`
+        );
       } else if (typeof profile.latitude === 'number' && typeof profile.longitude === 'number') {
-        const data = await fetchPrayerTimes({ lat: profile.latitude, lng: profile.longitude });
+        const data = await fetchPrayerTimes({
+          lat: profile.latitude,
+          lng: profile.longitude,
+          city: profile.city,
+          country: profile.country,
+        });
         setPrayerTimes(data);
       } else {
+        const known = resolveKnownLocation(profile.city, profile.country);
         const data = await fetchPrayerTimes({
-          city: profile.city || 'Cairo',
-          country: profile.country || 'Egypt',
+          city: profile.city || 'القاهرة',
+          country: profile.country || 'مصر',
+          lat: known?.lat,
+          lng: known?.lng,
+          method: known?.method,
         });
         setPrayerTimes(data);
       }
@@ -70,9 +101,49 @@ export function PrayerView({
     }
   };
 
+  const handleSelectKnownLocation = async (loc: (typeof KNOWN_LOCATIONS)[number]) => {
+    setLoadingTimes(true);
+    setTimesError(null);
+    setLocationStatusMsg(null);
+    try {
+      await updateProfileDetails(uid, profile.id, {
+        city: loc.cityAr,
+        country: loc.countryAr,
+        latitude: loc.lat,
+        longitude: loc.lng,
+      });
+      const data = await fetchPrayerTimes({
+        lat: loc.lat,
+        lng: loc.lng,
+        city: loc.cityEn,
+        country: loc.countryEn,
+        method: loc.method,
+      });
+      setPrayerTimes(data);
+      setShowCityPicker(false);
+      setLocationStatusMsg(`تم ضبط المواقيت لمدينة: ${loc.cityAr} — ${loc.countryAr}`);
+    } catch (err) {
+      setTimesError(err instanceof Error ? err.message : 'تعذر حفظ المدينة وتحديث المواقيت.');
+    } finally {
+      setLoadingTimes(false);
+    }
+  };
+
+  const filteredLocations = useMemo(() => {
+    const q = citySearch.trim().toLowerCase();
+    if (!q) return KNOWN_LOCATIONS;
+    return KNOWN_LOCATIONS.filter(
+      (loc) =>
+        loc.cityAr.toLowerCase().includes(q) ||
+        loc.cityEn.toLowerCase().includes(q) ||
+        loc.countryAr.toLowerCase().includes(q) ||
+        loc.aliases.some((a) => a.toLowerCase().includes(q))
+    );
+  }, [citySearch]);
+
   useEffect(() => {
     loadTimes(false);
-  }, [profile.id, profile.city, profile.country]);
+  }, [profile.id, profile.city, profile.country, profile.latitude, profile.longitude]);
 
   useEffect(() => {
     if (currentRecord) {
@@ -221,21 +292,29 @@ export function PrayerView({
             )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => loadTimes(true)}
               disabled={loadingTimes}
-              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
             >
               <MapPin className="w-4 h-4 text-emerald-300" />
-              <span>تحديد موقعي التلقائي</span>
+              <span>{loadingTimes ? 'جاري التحديد...' : 'تحديد موقعي التلقائي'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowCityPicker((prev) => !prev)}
+              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+            >
+              <Globe2 className="w-4 h-4 text-emerald-300" />
+              <span>اختيار المدينة يدوياً</span>
             </button>
             <button
               type="button"
               onClick={() => loadTimes(false)}
               disabled={loadingTimes}
-              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
             >
               <RefreshCw className={`w-4 h-4 ${loadingTimes ? 'animate-spin' : ''}`} />
               <span>تحديث</span>
@@ -255,7 +334,61 @@ export function PrayerView({
           </div>
         </div>
 
-        {timesError && <p className="text-xs text-amber-300 mb-3">{timesError}</p>}
+        {showCityPicker && (
+          <div className="mb-4 p-4 rounded-2xl bg-slate-950/50 border border-white/15 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <span className="text-xs font-bold text-emerald-200">
+                اختر المحافظة أو المدينة لضبط مواقيت الصلاة بدقة:
+              </span>
+              <input
+                type="text"
+                value={citySearch}
+                onChange={(e) => setCitySearch(e.target.value)}
+                placeholder="ابحث باسم المدينة أو المحافظة (مثال: القليوبية، القاهرة، الرياض)..."
+                className="sm:w-72 min-h-[36px] px-3 rounded-xl bg-white/10 border border-white/15 text-xs text-white placeholder:text-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+              />
+            </div>
+            <div className="max-h-48 overflow-y-auto grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-1.5">
+              {filteredLocations.map((loc) => {
+                const selected = profile.city === loc.cityAr;
+                return (
+                  <button
+                    key={loc.id}
+                    type="button"
+                    disabled={loadingTimes}
+                    onClick={() => handleSelectKnownLocation(loc)}
+                    className={`px-2.5 py-2 rounded-xl text-right text-xs transition-colors cursor-pointer ${
+                      selected
+                        ? 'bg-emerald-500 text-slate-950 font-bold'
+                        : 'bg-white/10 hover:bg-white/20 text-white'
+                    }`}
+                  >
+                    <div className="font-semibold truncate">{loc.cityAr}</div>
+                    <div className="text-[10px] opacity-75 truncate">{loc.countryAr}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {locationStatusMsg && (
+          <p className="text-xs text-emerald-200 bg-emerald-500/15 border border-emerald-400/30 rounded-xl px-3 py-2 mb-3">
+            {locationStatusMsg}
+          </p>
+        )}
+        {timesError && (
+          <div className="text-xs text-amber-200 bg-amber-500/15 border border-amber-400/30 rounded-xl px-3 py-2 mb-3 flex flex-wrap items-center justify-between gap-2">
+            <span>{timesError}</span>
+            <button
+              type="button"
+              onClick={() => setShowCityPicker(true)}
+              className="underline font-bold text-white cursor-pointer"
+            >
+              اختر المدينة يدوياً
+            </button>
+          </div>
+        )}
         {alertsMsg && <p className="text-xs text-emerald-200 mb-3">{alertsMsg}</p>}
 
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">

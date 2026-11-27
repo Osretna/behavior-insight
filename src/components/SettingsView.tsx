@@ -20,6 +20,7 @@ import {
   updateUserPreferences,
 } from '../lib/firestoreService';
 import { hashGuardianPin } from '../lib/apiClient';
+import { resolveKnownLocation } from '../lib/locations';
 
 export function SettingsView({
   uid,
@@ -79,12 +80,15 @@ export function SettingsView({
     setMessage(null);
     setError(null);
     try {
+      const known = resolveKnownLocation(city, country);
+      const cityChanged = city.trim() !== (profile.city || '').trim();
       await updateProfileDetails(uid, profile.id, {
         name: profileName,
         age: profileAge,
         city,
         country,
         dailyGoalMinutes,
+        ...(cityChanged && known ? { latitude: known.lat, longitude: known.lng } : {}),
       });
       setMessage('تم تحديث بيانات الملف الشخصي وموقع مواقيت الصلاة.');
     } catch (err) {

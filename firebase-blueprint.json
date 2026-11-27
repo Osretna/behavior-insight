@@ -13,6 +13,13 @@
         "theme": { "type": "string", "enum": ["dark", "light"] },
         "pinEnabled": { "type": "boolean" },
         "pinHash": { "type": "string", "maxLength": 256 },
+        "subscriptionStatus": { "type": "string", "enum": ["active", "suspended"] },
+        "validFrom": { "type": "string", "maxLength": 10 },
+        "validUntil": { "type": "string", "maxLength": 10 },
+        "subscriptionPlanLabel": { "type": "string", "maxLength": 80 },
+        "subscriptionPrice": { "type": "number" },
+        "lastLoginAt": { "type": "string", "maxLength": 64 },
+        "deviceInfo": { "type": "string", "maxLength": 200 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -277,6 +284,18 @@
         "uid": { "type": "string", "minLength": 1, "maxLength": 128 }
       },
       "required": ["uid"]
+    },
+    "SubscriptionSettings": {
+      "title": "SubscriptionSettings",
+      "description": "Global WhatsApp support number and default monthly subscription fee configured by admin.",
+      "type": "object",
+      "properties": {
+        "whatsappNumber": { "type": "string", "maxLength": 24 },
+        "defaultMonthlyPrice": { "type": "number" },
+        "currency": { "type": "string", "maxLength": 16 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["whatsappNumber", "defaultMonthlyPrice", "currency", "updatedAt"]
     }
   },
   "firestore": {
@@ -339,6 +358,10 @@
     "/admins/{userId}": {
       "schema": { "$ref": "#/entities/AdminRole" },
       "description": "Admin role lookup collection."
+    },
+    "/appSettings/{settingId}": {
+      "schema": { "$ref": "#/entities/SubscriptionSettings" },
+      "description": "Global application subscription & WhatsApp support configuration."
     }
   }
 }

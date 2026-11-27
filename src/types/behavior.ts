@@ -22,6 +22,8 @@ export interface AxisWeights {
   responsibilities: number;
 }
 
+export type SubscriptionStatus = 'active' | 'suspended';
+
 export interface UserAccount {
   uid: string;
   email: string;
@@ -31,7 +33,21 @@ export interface UserAccount {
   theme: 'dark' | 'light';
   pinEnabled?: boolean;
   pinHash?: string;
+  subscriptionStatus?: SubscriptionStatus;
+  validFrom?: string;
+  validUntil?: string;
+  subscriptionPlanLabel?: string;
+  subscriptionPrice?: number;
+  lastLoginAt?: string;
+  deviceInfo?: string;
   createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
+export interface SubscriptionSettings {
+  whatsappNumber: string;
+  defaultMonthlyPrice: number;
+  currency: string;
   updatedAt?: unknown;
 }
 
